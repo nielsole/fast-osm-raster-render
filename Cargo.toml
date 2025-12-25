@@ -1,0 +1,45 @@
+[package]
+name = "rust-osm-renderer"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+# Vulkan rendering
+ash = "0.38"
+gpu-allocator = "0.28"
+
+# OSM data processing
+osmpbf = "0.3"
+memmap2 = "0.9"
+byteorder = "1.5"
+
+# HTTP server
+tokio = { version = "1.40", features = ["full"] }
+axum = "0.7"
+tower-http = { version = "0.5", features = ["fs"] }
+
+# Image processing
+image = { version = "0.25", features = ["png"] }
+
+# Concurrency
+rayon = "1.10"
+threadpool = "1.8"
+
+# Utilities
+num_cpus = "1.16"
+thiserror = "1.0"
+anyhow = "1.0"
+log = "0.4"
+env_logger = "0.11"
+
+[build-dependencies]
+shaderc = "0.8"
+
+[dev-dependencies]
+tempfile = "3.8"
+env_logger = "0.11"
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
