@@ -187,6 +187,9 @@ impl VulkanRenderer {
 
         // Cleanup
         unsafe {
+            // Free descriptor set first (return it to the pool)
+            self.context.device.free_descriptor_sets(self.descriptor_pool, &[descriptor_set])?;
+            // Then destroy the uniform buffer
             self.context.device.destroy_buffer(uniform_buffer, None);
         }
         {
