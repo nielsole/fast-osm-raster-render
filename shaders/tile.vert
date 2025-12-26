@@ -21,16 +21,15 @@ float lat2y_mercator(float lat) {
 void main() {
     // Convert longitude to x coordinate (linear)
     float x = (position.x - ubo.bbox.x) / (ubo.bbox.z - ubo.bbox.x);
-    x = clamp(x, 0.0, 1.0);
 
     // Convert latitude to y coordinate (Mercator)
     float y_mercator = lat2y_mercator(position.y);
     float min_y_mercator = lat2y_mercator(ubo.bbox.y);
     float max_y_mercator = lat2y_mercator(ubo.bbox.w);
     float y = (y_mercator - min_y_mercator) / (max_y_mercator - min_y_mercator);
-    y = clamp(y, 0.0, 1.0);
 
     // Map 0-1 normalized coordinates directly to NDC -1 to 1
+    // No clamping - let GPU viewport clipping handle lines extending beyond tile
     float ndc_x = x * 2.0 - 1.0;
     float ndc_y = (1.0 - y) * 2.0 - 1.0;  // Flip Y for correct orientation
 
