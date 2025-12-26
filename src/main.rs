@@ -40,7 +40,8 @@ async fn main() -> anyhow::Result<()> {
     let mut temp_file = std::fs::File::create(temp_file_path)?;
 
     // Load OSM data and build spatial index
-    let max_z = 15; // Maximum zoom level
+    // We index up to zoom 15, but can render higher zoom levels by using parent tiles
+    let max_z = 15;
     log::info!("Loading OSM data (max zoom: {})...", max_z);
     let tile_index = load_osm_data(osm_path, max_z, &mut temp_file)?;
 

@@ -39,6 +39,25 @@ impl Tile {
             })
         }
     }
+
+    /// Get ancestor tile at a specific zoom level
+    /// Returns None if target_z > self.z
+    pub fn get_ancestor(&self, target_z: u32) -> Option<Tile> {
+        if target_z > self.z {
+            return None;
+        }
+        if target_z == self.z {
+            return Some(*self);
+        }
+
+        // Calculate how many zoom levels to go up
+        let levels_up = self.z - target_z;
+        Some(Tile {
+            x: self.x >> levels_up,
+            y: self.y >> levels_up,
+            z: target_z,
+        })
+    }
 }
 
 impl fmt::Display for Tile {
@@ -171,6 +190,30 @@ mod tests {
 
         let root = Tile::new(0, 0, 0);
         assert_eq!(root.get_parent(), None);
+    }
+
+    #[test]
+    fn test_tile_ancestor() {
+        // Test getting ancestor at lower zoom
+        let tile = Tile::new(100, 200, 17);
+        let ancestor = tile.get_ancestor(15).unwrap();
+        // 100 >> 2 = 25, 200 >> 2 = 50
+        assert_eq!(ancestor, Tile::new(25, 50, 15));
+
+        // Test getting self
+        let tile = Tile::new(10, 20, 15);
+        let ancestor = tile.get_ancestor(15).unwrap();
+        assert_eq!(ancestor, tile);
+
+        // Test invalid (target_z > self.z)
+        let tile = Tile::new(10, 20, 15);
+        assert_eq!(tile.get_ancestor(16), None);
+
+        // Test multiple levels
+        let tile = Tile::new(64, 128, 18);
+        let ancestor = tile.get_ancestor(15).unwrap();
+        // 64 >> 3 = 8, 128 >> 3 = 16
+        assert_eq!(ancestor, Tile::new(8, 16, 15));
     }
 
     #[test]

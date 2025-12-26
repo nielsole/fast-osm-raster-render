@@ -2,8 +2,7 @@ use rust_osm_renderer::data::serialization::write_map_object;
 use rust_osm_renderer::data::spatial::TileIndex;
 use rust_osm_renderer::data::types::{BoundingBox, MapObject, Point, Tile};
 use rust_osm_renderer::data::mmap::MappedData;
-use rust_osm_renderer::renderer::VulkanRenderer;
-use std::fs::File;
+use rust_osm_renderer::renderer::{VulkanRenderer, ShaderType};
 use tempfile::NamedTempFile;
 
 #[test]
@@ -63,7 +62,7 @@ fn test_vulkan_renderer_with_synthetic_data() -> Result<(), Box<dyn std::error::
     let mmap_data = MappedData::new(temp_file.path())?;
 
     // Create renderer with simple shader for testing
-    let mut renderer = VulkanRenderer::new(tile_index.max_points, true)
+    let mut renderer = VulkanRenderer::new(tile_index.max_points, ShaderType::Simple)
         .map_err(|e| format!("Failed to create Vulkan renderer: {}", e))?;
 
     // Render tile

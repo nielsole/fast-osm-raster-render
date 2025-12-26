@@ -140,17 +140,30 @@ impl VulkanRenderer {
         tile_index: &TileIndex,
         mmap_data: &MappedData,
     ) -> Result<RgbaImage, VulkanError> {
-        // Get map object offsets for this tile
-        let offsets = match tile_index.get(tile) {
+        // For zoom levels > 15, use the parent tile's data at zoom 15
+        // The bounding box filtering will select only relevant objects
+        const MAX_INDEXED_ZOOM: u32 = 15;
+        let lookup_tile = if tile.z > MAX_INDEXED_ZOOM {
+            let ancestor = tile.get_ancestor(MAX_INDEXED_ZOOM)
+                .expect("get_ancestor should always succeed for lower zoom");
+            log::info!("Tile {:?} is above max indexed zoom, using ancestor {:?}", tile, ancestor);
+            ancestor
+        } else {
+            *tile
+        };
+
+        // Get map object offsets for the lookup tile
+        let offsets = match tile_index.get(&lookup_tile) {
             Some(offsets) => offsets,
             None => {
-                log::warn!("No tile index data for tile {:?}", tile);
+                log::warn!("No tile index data for tile {:?}", lookup_tile);
                 // No data for this tile, return empty white image
                 return Ok(RgbaImage::from_pixel(TILE_SIZE, TILE_SIZE, image::Rgba([255, 255, 255, 255])));
             }
         };
 
-        log::info!("Rendering tile {:?} with {} map objects", tile, offsets.len());
+        log::info!("Rendering tile {:?} with {} map objects from lookup tile {:?}",
+                   tile, offsets.len(), lookup_tile);
 
         // Get bounding box for tile
         let bbox = get_bounding_box(tile);

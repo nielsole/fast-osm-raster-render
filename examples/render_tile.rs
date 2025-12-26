@@ -34,6 +34,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Load OSM data
     let mut temp_file = NamedTempFile::new()?;
     log::info!("Loading OSM data...");
+    // Index up to zoom 15, higher zooms will use parent tile data
     let tile_index = load_osm_data(osm_path, 15, temp_file.as_file_mut())?;
     log::info!("Loaded {} tiles", tile_index.len());
 
