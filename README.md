@@ -4,6 +4,26 @@ This repo contains a hardware-accelerated OSM tile renderer written in Rust usin
 
 This is a complete rewrite of the [Go + OpenGL implementation](https://github.com/nielsole/go-gl-osm) to address OpenGL thread affinity issues and leverage Vulkan's better multi-threading support.
 
+## Vision
+
+Rasterized maps offer compelling advantages: they work on any device, deliver excellent performance, run easily offline, integrate seamlessly with slippy map interfaces, and can display rich cartographic detail. While they lack the interactivity of vector tiles, their information density and visual clarity make them ideal for traditional mapping. Yet traditional OSM rendering infrastructure remains anchored to single-server architectures that rely heavily on pre-rendering and caching because real-time rendering—especially at lower zoom levels—is prohibitively expensive.
+
+This project challenges that paradigm through two key innovations:
+1. **Application-specific data layout**: Spatial indexing and memory-mapped data structures optimized specifically for tile rendering
+2. **Hardware-accelerated rendering**: GPU-based rendering pipeline leveraging modern Vulkan APIs
+
+The goal is to make dynamic, on-demand tile rendering feasible without caching, while enabling horizontal scaling across multiple servers.
+
+**Target Use Case: Detail-Rich Traditional Maps**
+
+This renderer targets traditional cartography—detailed maps that empower users to navigate and develop spatial awareness. Unlike mobility apps (Google Maps, navigation services) that prioritize route guidance and real-time traffic, traditional maps emphasize:
+- Rich cartographic detail and visual hierarchy
+- Comprehensive feature representation (buildings, landuse, natural features)
+- Spatial context and orientation
+- Offline capability and user control
+
+This combination—on-demand rendering performance + traditional map detail + user empowerment—is what sets this project apart and justifies its existence.
+
 ## Features
 
 - **Vulkan-based rendering**: Headless GPU-accelerated tile rendering
