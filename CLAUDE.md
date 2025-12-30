@@ -176,7 +176,24 @@ vertices[index+3] = points[i].lat;
 
 Server stores data in `/tmp/rust-osm-renderer-data.bin` (memory-mapped file).
 Port 8080 is hardcoded.
-Leaflet viewer available at http://localhost:8080/ (if static/ directory exists).
+
+## Web Viewer
+
+**index.html** - MapLibre GL JS with 512px (@2x) tiles and nearest-neighbor resampling
+
+Features:
+- 512px tiles for high-resolution rendering
+- Nearest-neighbor resampling to eliminate grid artifacts
+- Instant tile display (no fade animation)
+- Crisp rendering at all zoom levels (including fractional)
+- Supports zoom levels 0-18
+
+Configuration:
+- Uses `/tile/{z}/{x}/{y}@2x.png` endpoint for 512px tiles
+- `raster-resampling: 'nearest'` for sharp edges without grid pattern
+- `tileSize: 512` tells MapLibre these are high-resolution tiles
+
+Access at: http://localhost:8080/
 
 ## Debugging Shaders
 

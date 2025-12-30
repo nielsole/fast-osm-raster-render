@@ -24,6 +24,9 @@ struct UniformBufferObject {
 
 /// Vulkan renderer for OSM tiles
 pub struct VulkanRenderer {
+    // Tile size (256 or 512)
+    tile_size: u32,
+
     // Reusable resources
     command_buffer: vk::CommandBuffer,
     fence: vk::Fence,
@@ -61,6 +64,11 @@ struct RenderTarget {
 impl VulkanRenderer {
     /// Create a new Vulkan renderer
     pub fn new(max_points: usize, shader_type: ShaderType) -> Result<Self, VulkanError> {
+        Self::new_with_tile_size(max_points, shader_type, TILE_SIZE)
+    }
+
+    /// Create a new Vulkan renderer with custom tile size
+    pub fn new_with_tile_size(max_points: usize, shader_type: ShaderType, tile_size: u32) -> Result<Self, VulkanError> {
         // Ensure we have a minimum buffer size even with no data
         let max_points = max_points.max(1000); // Minimum 1000 points
 
@@ -89,6 +97,7 @@ impl VulkanRenderer {
             render_pass,
             descriptor_set_layout,
             shader_type,
+            tile_size,
         )?;
 
         // Create descriptor pool
@@ -117,6 +126,7 @@ impl VulkanRenderer {
         };
 
         Ok(VulkanRenderer {
+            tile_size,
             context,
             memory_manager,
             render_pass,
@@ -158,7 +168,7 @@ impl VulkanRenderer {
             None => {
                 log::warn!("No tile index data for tile {:?}", lookup_tile);
                 // No data for this tile, return empty white image
-                return Ok(RgbaImage::from_pixel(TILE_SIZE, TILE_SIZE, image::Rgba([255, 255, 255, 255])));
+                return Ok(RgbaImage::from_pixel(self.tile_size, self.tile_size, image::Rgba([255, 255, 255, 255])));
             }
         };
 
@@ -183,7 +193,7 @@ impl VulkanRenderer {
         if vertex_count == 0 {
             log::warn!("No visible vertices, returning white image");
             // No visible vertices, return white image
-            return Ok(RgbaImage::from_pixel(TILE_SIZE, TILE_SIZE, image::Rgba([255, 255, 255, 255])));
+            return Ok(RgbaImage::from_pixel(self.tile_size, self.tile_size, image::Rgba([255, 255, 255, 255])));
         }
 
         // Create uniform buffer
@@ -220,8 +230,8 @@ impl VulkanRenderer {
         let (color_image, color_image_allocation) = create_image(
             &self.context.device,
             &mut allocator,
-            TILE_SIZE,
-            TILE_SIZE,
+            self.tile_size,
+            self.tile_size,
             vk::Format::R8G8B8A8_UNORM,
             vk::ImageUsageFlags::COLOR_ATTACHMENT | vk::ImageUsageFlags::TRANSFER_SRC,
             MemoryLocation::GpuOnly,
@@ -240,8 +250,8 @@ impl VulkanRenderer {
         let framebuffer_info = vk::FramebufferCreateInfo::default()
             .render_pass(self.render_pass)
             .attachments(&attachments)
-            .width(TILE_SIZE)
-            .height(TILE_SIZE)
+            .width(self.tile_size)
+            .height(self.tile_size)
             .layers(1);
 
         let framebuffer = unsafe {
@@ -249,7 +259,7 @@ impl VulkanRenderer {
         };
 
         // Create staging buffer for readback
-        let staging_size = (TILE_SIZE * TILE_SIZE * 4) as vk::DeviceSize;
+        let staging_size = (self.tile_size * self.tile_size * 4) as vk::DeviceSize;
         let (staging_buffer, staging_buffer_allocation) = create_buffer(
             &self.context.device,
             &mut allocator,
@@ -345,9 +355,9 @@ impl VulkanRenderer {
                 bbox.max.lon as f32,
                 bbox.max.lat as f32,
             ],
-            tile_size: TILE_SIZE as f32,
+            tile_size: self.tile_size as f32,
             _padding: [0.0; 11],
-            projection: create_orthographic_projection(),
+            projection: create_orthographic_projection(self.tile_size),
         };
 
         log::info!("UBO: bbox=({}, {}, {}, {}), tileSize={}",
@@ -434,7 +444,7 @@ impl VulkanRenderer {
             .framebuffer(render_target.framebuffer)
             .render_area(vk::Rect2D {
                 offset: vk::Offset2D { x: 0, y: 0 },
-                extent: vk::Extent2D { width: TILE_SIZE, height: TILE_SIZE },
+                extent: vk::Extent2D { width: self.tile_size, height: self.tile_size },
             })
             .clear_values(&clear_values);
 
@@ -478,8 +488,8 @@ impl VulkanRenderer {
             self.command_buffer,
             render_target.color_image,
             render_target.staging_buffer,
-            TILE_SIZE,
-            TILE_SIZE,
+            self.tile_size,
+            self.tile_size,
         );
 
         end_command_buffer(&self.context.device, self.command_buffer)?;
@@ -506,11 +516,11 @@ impl VulkanRenderer {
         let image_data = unsafe {
             std::slice::from_raw_parts(
                 staging_ptr as *const u8,
-                (TILE_SIZE * TILE_SIZE * 4) as usize,
+                (self.tile_size * self.tile_size * 4) as usize,
             )
         };
 
-        let image = RgbaImage::from_raw(TILE_SIZE, TILE_SIZE, image_data.to_vec())
+        let image = RgbaImage::from_raw(self.tile_size, self.tile_size, image_data.to_vec())
             .ok_or_else(|| VulkanError::IoError(std::io::Error::new(
                 std::io::ErrorKind::Other,
                 "Failed to create image from buffer",
@@ -554,11 +564,11 @@ impl Drop for VulkanRenderer {
     }
 }
 
-fn create_orthographic_projection() -> [[f32; 4]; 4] {
+fn create_orthographic_projection(tile_size: u32) -> [[f32; 4]; 4] {
     // Orthographic projection matching Go implementation
-    // Maps 0-256 pixel space to NDC (-1 to 1)
+    // Maps 0-{tile_size} pixel space to NDC (-1 to 1)
     // NOTE: GLSL uses column-major, so we need to transpose
-    let size = TILE_SIZE as f32;
+    let size = tile_size as f32;
 
     // TRANSPOSED for column-major GLSL
     [

@@ -1,0 +1,17 @@
+# Core testing
+pytest>=8.0.0
+pytest-timeout>=2.2.0
+
+# Image processing
+Pillow>=10.0.0
+numpy>=1.24.0
+
+# OSM data generation
+osmium>=3.7.0
+
+# Performance monitoring
+psutil>=5.9.0
+
+# Optional: Enhanced testing
+pytest-html>=4.0.0          # HTML reports
+pytest-xdist>=3.5.0         # Parallel execution

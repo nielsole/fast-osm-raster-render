@@ -3,6 +3,7 @@ use std::fs::File;
 use std::io::Read;
 
 pub const TILE_SIZE: u32 = 256;
+pub const TILE_SIZE_2X: u32 = 512;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ShaderType {
@@ -17,6 +18,7 @@ pub fn create_graphics_pipeline(
     render_pass: vk::RenderPass,
     descriptor_set_layout: vk::DescriptorSetLayout,
     shader_type: ShaderType,
+    tile_size: u32,
 ) -> Result<(vk::Pipeline, vk::PipelineLayout), vk::Result> {
     // Load shader modules
     let vert_path = match shader_type {
@@ -62,12 +64,12 @@ pub fn create_graphics_pipeline(
         .topology(vk::PrimitiveTopology::LINE_LIST)
         .primitive_restart_enable(false);
 
-    // Viewport and scissor
+    // Viewport and scissor (use provided tile_size)
     let viewports = [vk::Viewport {
         x: 0.0,
         y: 0.0,
-        width: TILE_SIZE as f32,
-        height: TILE_SIZE as f32,
+        width: tile_size as f32,
+        height: tile_size as f32,
         min_depth: 0.0,
         max_depth: 1.0,
     }];
@@ -75,8 +77,8 @@ pub fn create_graphics_pipeline(
     let scissors = [vk::Rect2D {
         offset: vk::Offset2D { x: 0, y: 0 },
         extent: vk::Extent2D {
-            width: TILE_SIZE,
-            height: TILE_SIZE,
+            width: tile_size,
+            height: tile_size,
         },
     }];
 
