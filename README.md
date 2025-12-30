@@ -48,6 +48,34 @@ osmium add-locations-to-ways input.osm.pbf -o prepared.osm.pbf
 
 Alternatively, the OSM loader needs to be updated to resolve node coordinates in a two-pass approach.
 
+## Example Output
+
+Current rendering capability demonstrated with Hamburg, Germany (tile 11/1081/660):
+
+![Hamburg rendering example](hamburg.png)
+
+**Current State: EXTREMELY BASIC**
+
+The renderer is in very early stages and only produces black lines on a white background. This is nowhere near the capability of established renderers like Mapnik, Mapbox, or even simple Leaflet styles.
+
+What's working:
+- Raw road geometry rendering (black lines only)
+- Vulkan headless rendering pipeline
+- Web Mercator projection on GPU
+- Memory-mapped data access
+
+What's completely missing (i.e., what every real map renderer has):
+- Any styling whatsoever (colors, widths, road classifications)
+- Water bodies, parks, buildings, landuse polygons
+- Labels, text rendering, icons
+- Zoom-dependent feature filtering
+- Road classification (highways vs residential streets)
+- Multiple layers and z-ordering
+- Anti-aliasing and visual polish
+- Pretty much everything that makes a map usable
+
+This is essentially a proof-of-concept that the Vulkan pipeline can draw lines. It's not a production-ready renderer by any measure.
+
 ## Prerequisites
 
 - **Rust**: 1.88 or later (due to osmpbf dependency)
