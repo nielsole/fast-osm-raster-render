@@ -54,6 +54,28 @@ fn main() -> Result<(), Box<dyn Error>> {
     )?;
     fs::write(out_dir.join("tile.frag.spv"), frag_spirv.as_binary_u8())?;
 
+    // Compile styled vertex shader (Per-object: with color passthrough)
+    let vert_styled_source = fs::read_to_string(shader_dir.join("tile_styled.vert"))?;
+    let vert_styled_spirv = compiler.compile_into_spirv(
+        &vert_styled_source,
+        shaderc::ShaderKind::Vertex,
+        "tile_styled.vert",
+        "main",
+        None,
+    )?;
+    fs::write(out_dir.join("tile_styled.vert.spv"), vert_styled_spirv.as_binary_u8())?;
+
+    // Compile styled fragment shader (Per-object: uses vertex color)
+    let frag_styled_source = fs::read_to_string(shader_dir.join("tile_styled.frag"))?;
+    let frag_styled_spirv = compiler.compile_into_spirv(
+        &frag_styled_source,
+        shaderc::ShaderKind::Fragment,
+        "tile_styled.frag",
+        "main",
+        None,
+    )?;
+    fs::write(out_dir.join("tile_styled.frag.spv"), frag_styled_spirv.as_binary_u8())?;
+
     println!("Shaders compiled successfully");
     Ok(())
 }

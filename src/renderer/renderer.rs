@@ -6,10 +6,13 @@ use crate::data::mmap::{MappedData, MapObjectView};
 use crate::data::spatial::TileIndex;
 use crate::data::types::{BoundingBox, Tile};
 use crate::projection::get_bounding_box;
+use crate::style::{parse_mapcss, evaluate_style, StyleSheet}; // Phase 0: MapCSS support
+use crate::style::types::ObjectType;
 use ash::vk;
 use gpu_allocator::vulkan::{Allocation, Allocator};
 use gpu_allocator::MemoryLocation;
 use image::RgbaImage;
+use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
 /// Uniform buffer object matching the shader layout
@@ -45,6 +48,10 @@ pub struct VulkanRenderer {
     pipeline_layout: vk::PipelineLayout,
     pipeline: vk::Pipeline,
     descriptor_pool: vk::DescriptorPool,
+
+    // Phase 0: Optional stylesheet for MapCSS styling
+    stylesheet: Option<StyleSheet>,
+    data_file_path: Option<String>, // Phase 0: Path to data file for reading tags
 
     // Memory manager must be dropped before context
     memory_manager: Arc<Mutex<Allocator>>,
@@ -111,8 +118,15 @@ impl VulkanRenderer {
 
         // Pre-allocate vertex buffer
         // Tiles can have tens of thousands of objects with complex geometry
-        // Allocate a large fixed buffer (10M floats = 40MB)
-        let vertex_buffer_capacity = 10_000_000; // Fixed large allocation
+        // Allocate a large fixed buffer based on shader type
+        // Regular shader: (lon, lat) = 2 floats per vertex
+        // Styled shader: (lon, lat, r, g, b, a) = 6 floats per vertex (3x larger)
+        // To maintain same vertex capacity, styled shader needs 3x the float capacity
+        let base_capacity = 10_000_000; // 10M floats for regular shader = 40MB
+        let vertex_buffer_capacity = match shader_type {
+            ShaderType::Styled => base_capacity * 3, // 30M floats = 120MB
+            _ => base_capacity,
+        };
         let (vertex_buffer, vertex_buffer_allocation) = {
             let mut allocator = memory_manager.lock().unwrap();
             create_buffer(
@@ -140,7 +154,25 @@ impl VulkanRenderer {
             vertex_buffer: Some(vertex_buffer),
             vertex_buffer_allocation: Some(vertex_buffer_allocation),
             vertex_buffer_capacity,
+            stylesheet: None, // Phase 0: Initialize without stylesheet
+            data_file_path: None, // Phase 0: Will be set via set_data_file_path()
         })
+    }
+
+    /// Set MapCSS stylesheet for rendering (Phase 0)
+    pub fn set_stylesheet(&mut self, mapcss: &str) -> Result<(), String> {
+        match parse_mapcss(mapcss) {
+            Ok(stylesheet) => {
+                self.stylesheet = Some(stylesheet);
+                Ok(())
+            }
+            Err(e) => Err(format!("Failed to parse MapCSS: {}", e)),
+        }
+    }
+
+    /// Set data file path for tag reading (Phase 0)
+    pub fn set_data_file_path(&mut self, path: String) {
+        self.data_file_path = Some(path);
     }
 
     /// Render a tile and return the image
@@ -185,8 +217,8 @@ impl VulkanRenderer {
             self.render_target = Some(self.create_render_target()?);
         }
 
-        // Build vertex buffer
-        let vertex_count = self.build_vertex_buffer(&offsets, mmap_data, &bbox)?;
+        // Build vertex buffer (per-object styling handled inside)
+        let vertex_count = self.build_vertex_buffer(&offsets, mmap_data, &bbox, tile.z, tile)?;
 
         log::info!("Built vertex buffer with {} vertices", vertex_count);
 
@@ -284,24 +316,38 @@ impl VulkanRenderer {
         offsets: &[u64],
         mmap_data: &MappedData,
         bbox: &BoundingBox,
+        zoom: u32,
+        tile: &Tile,
     ) -> Result<usize, VulkanError> {
         let vertex_buffer_allocation = self.vertex_buffer_allocation.as_ref().unwrap();
-
-        // Map vertex buffer
         let data_ptr = vertex_buffer_allocation.mapped_ptr().unwrap().as_ptr() as *mut f32;
         let mut vertex_count = 0;
+
+        // Determine vertex size based on shader type
+        let (vertex_size, use_colors) = if self.pipeline == self.pipeline {  // Always true, but need shader_type
+            // Check if we have a stylesheet configured
+            match self.stylesheet {
+                Some(_) => (6, true),  // Styled: (lon, lat, r, g, b, a)
+                None => (2, false),     // Regular: (lon, lat)
+            }
+        } else {
+            (2, false)
+        };
+
+        log::info!("Building vertex buffer for tile {:?}: {} objects, vertex_size={}, capacity={} floats",
+                   tile, offsets.len(), vertex_size, self.vertex_buffer_capacity);
 
         unsafe {
             let vertices = std::slice::from_raw_parts_mut(data_ptr, self.vertex_buffer_capacity);
             let mut index = 0;
 
-            for (i, &offset) in offsets.iter().enumerate() {
+            for (obj_idx, &offset) in offsets.iter().enumerate() {
                 let map_object = mmap_data.read_map_object(offset);
                 let obj_bbox = map_object.bounding_box();
                 let points = map_object.points();
 
                 log::debug!("Map object {}: bbox=({}, {}) to ({}, {}), {} points",
-                          i, obj_bbox.min.lon, obj_bbox.min.lat,
+                          obj_idx, obj_bbox.min.lon, obj_bbox.min.lat,
                           obj_bbox.max.lon, obj_bbox.max.lat, points.len());
 
                 // Check if bounding box overlaps
@@ -316,28 +362,80 @@ impl VulkanRenderer {
                     continue;
                 }
 
+                // Per-object styling: Read tags and evaluate MapCSS
+                // OPTIMIZATION: Read tags from memory-mapped data instead of opening file
+                let color = if use_colors {
+                    if let Some(ref stylesheet) = &self.stylesheet {
+                        let mut tags = HashMap::new();
+                        if let Some(highway) = map_object.highway_tag() {
+                            tags.insert("highway".to_string(), highway);
+                        }
+
+                        if let Some(evaluated) = evaluate_style(stylesheet, ObjectType::Way, &tags, zoom) {
+                            if let Some(c) = evaluated.color {
+                                c.to_array()
+                            } else {
+                                [0.0, 0.0, 0.0, 1.0] // Default black
+                            }
+                        } else {
+                            [0.0, 0.0, 0.0, 1.0] // Default black
+                        }
+                    } else {
+                        [0.0, 0.0, 0.0, 1.0] // Default black
+                    }
+                } else {
+                    [0.0, 0.0, 0.0, 1.0] // Not used for non-styled shaders
+                };
+
                 for i in 1..points.len() {
-                    if index + 4 > self.vertex_buffer_capacity {
-                        log::warn!("Vertex buffer overflow, stopping");
+                    let required_space = vertex_size * 2; // Two vertices per line
+                    if index + required_space > self.vertex_buffer_capacity {
+                        log::error!("Vertex buffer overflow for tile {:?}! Object {}/{}, used {} floats, capacity {} floats. Vertex size: {}, vertices so far: {}",
+                                   tile, obj_idx + 1, offsets.len(), index, self.vertex_buffer_capacity, vertex_size, vertex_count);
+                        log::error!("  This tile has too much geometry. Increase vertex_buffer_capacity or implement dynamic allocation.");
                         break;
                     }
 
-                    // Previous point
-                    vertices[index] = points[i - 1].lon as f32;
-                    vertices[index + 1] = points[i - 1].lat as f32;
+                    if use_colors {
+                        // Styled shader: (lon, lat, r, g, b, a) per vertex
+                        // Previous point
+                        vertices[index] = points[i - 1].lon as f32;
+                        vertices[index + 1] = points[i - 1].lat as f32;
+                        vertices[index + 2] = color[0];
+                        vertices[index + 3] = color[1];
+                        vertices[index + 4] = color[2];
+                        vertices[index + 5] = color[3];
 
-                    // Current point
-                    vertices[index + 2] = points[i].lon as f32;
-                    vertices[index + 3] = points[i].lat as f32;
+                        // Current point
+                        vertices[index + 6] = points[i].lon as f32;
+                        vertices[index + 7] = points[i].lat as f32;
+                        vertices[index + 8] = color[0];
+                        vertices[index + 9] = color[1];
+                        vertices[index + 10] = color[2];
+                        vertices[index + 11] = color[3];
 
-                    if vertex_count < 6 {  // Log first 3 lines only
-                        log::info!("    Line {}: ({}, {}) -> ({}, {})",
-                                  vertex_count / 2,
-                                  points[i - 1].lon, points[i - 1].lat,
-                                  points[i].lon, points[i].lat);
+                        index += 12;
+                    } else {
+                        // Regular shader: (lon, lat) per vertex
+                        // Previous point
+                        vertices[index] = points[i - 1].lon as f32;
+                        vertices[index + 1] = points[i - 1].lat as f32;
+
+                        // Current point
+                        vertices[index + 2] = points[i].lon as f32;
+                        vertices[index + 3] = points[i].lat as f32;
+
+                        index += 4;
                     }
 
-                    index += 4;
+                    if vertex_count < 6 && obj_idx == 0 {  // Log first 3 lines of first object
+                        log::info!("    Line {}: ({}, {}) -> ({}, {}) color={:?}",
+                                  vertex_count / 2,
+                                  points[i - 1].lon, points[i - 1].lat,
+                                  points[i].lon, points[i].lat,
+                                  if use_colors { color } else { [0.0, 0.0, 0.0, 0.0] });
+                    }
+
                     vertex_count += 2;
                 }
                 log::debug!("  -> Added {} line segments", points.len() - 1);

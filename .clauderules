@@ -1,0 +1,95 @@
+# Claude Code Rules for Rust OSM Renderer
+
+These rules enforce performance testing conventions for this project.
+
+## Performance Testing Requirements
+
+### When to Run Benchmarks
+
+Run `cargo bench --bench tile_rendering` after changes to:
+- `src/renderer/` - Any rendering code
+- `src/data/mmap.rs` - Memory-mapped data access
+- `src/data/serialization.rs` - Data serialization format
+- `src/style/` - MapCSS evaluation
+- `shaders/` - Shader code
+- Any code in the hot path of tile rendering
+
+### Performance Documentation
+
+**REQUIRED**: When making performance-critical changes:
+
+1. Run benchmarks before and after changes
+2. Update `PERFORMANCE.md` with:
+   - What changed
+   - Performance impact (before/after timings)
+   - Which tiles were tested
+   - Whether <50ms target is maintained
+
+3. Include performance results in commit message:
+   ```
+   Example commit message format:
+
+   Optimize tag reading from memory-mapped data
+
+   Performance impact:
+   - Tile 11/1080/661: 2.7s → 15.7ms (172x speedup)
+   - All tiles now <50ms target
+
+   Changed memory-mapped view to read tags directly instead
+   of opening file per object (eliminated 182K file opens).
+   ```
+
+### Performance Target
+
+**STRICT REQUIREMENT**: All tiles MUST render in <50ms
+
+- If any tile exceeds 50ms, the change must be optimized or reverted
+- Document any tiles approaching the limit (>40ms) as potential concerns
+- Maintain at least 20% headroom when possible
+
+### Commit Requirements for Performance Changes
+
+Every commit touching performance-critical files must:
+- [ ] Include benchmark results in commit message
+- [ ] Update PERFORMANCE.md if results changed significantly (>10%)
+- [ ] Verify all test tiles still meet <50ms target
+- [ ] Document any new performance optimizations applied
+
+### Test Tiles
+
+Standard performance test tiles:
+- `11/1082/661` - Overflow edge case (430 objects)
+- `11/1080/661` - High complexity (182K objects)
+
+Add additional tiles to benchmarks if they reveal performance issues.
+
+## Code Conventions
+
+### Avoid Performance Anti-patterns
+
+- ❌ Opening files in hot loops
+- ❌ Allocating in per-object rendering code
+- ❌ Unnecessary string cloning
+- ❌ Repeated evaluation of same selectors
+
+✅ Use memory-mapped data
+✅ Pre-allocate buffers
+✅ Cache evaluated styles
+✅ Profile before optimizing
+
+## Claude AI Assistant Behavior
+
+When I (Claude Code) make changes to performance-critical code:
+
+1. I MUST proactively run benchmarks after the change
+2. I MUST ask if performance testing was done before committing
+3. I MUST remind about updating PERFORMANCE.md
+4. I MUST include performance impact in commit messages
+5. I MUST flag if changes might affect the <50ms target
+6. I MUST refuse to commit performance-critical changes without benchmark results
+
+## Reference
+
+- Benchmark: `benches/tile_rendering.rs`
+- Performance docs: `PERFORMANCE.md`
+- Plan: `/home/nokadmin/.claude/plans/glowing-strolling-dragon.md`

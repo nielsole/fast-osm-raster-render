@@ -47,7 +47,17 @@ pub async fn handle_tile_request(
             if renderer_opt.is_none() {
                 let max_points = state.data.max_points;
                 match VulkanRenderer::new_with_tile_size(max_points, state.shader_type, TILE_SIZE_2X) {
-                    Ok(renderer) => {
+                    Ok(mut renderer) => {
+                        // Phase 0: Configure MapCSS if using styled shader
+                        if state.shader_type == ShaderType::Styled {
+                            renderer.set_data_file_path(state.data_file_path.clone());
+                            if let Some(ref mapcss) = state.stylesheet {
+                                if let Err(e) = renderer.set_stylesheet(mapcss) {
+                                    log::error!("Failed to set stylesheet: {}", e);
+                                    return Err(StatusCode::INTERNAL_SERVER_ERROR);
+                                }
+                            }
+                        }
                         *renderer_opt = Some(renderer);
                     }
                     Err(e) => {
@@ -73,7 +83,17 @@ pub async fn handle_tile_request(
             if renderer_opt.is_none() {
                 let max_points = state.data.max_points;
                 match VulkanRenderer::new(max_points, state.shader_type) {
-                    Ok(renderer) => {
+                    Ok(mut renderer) => {
+                        // Phase 0: Configure MapCSS if using styled shader
+                        if state.shader_type == ShaderType::Styled {
+                            renderer.set_data_file_path(state.data_file_path.clone());
+                            if let Some(ref mapcss) = state.stylesheet {
+                                if let Err(e) = renderer.set_stylesheet(mapcss) {
+                                    log::error!("Failed to set stylesheet: {}", e);
+                                    return Err(StatusCode::INTERNAL_SERVER_ERROR);
+                                }
+                            }
+                        }
                         *renderer_opt = Some(renderer);
                     }
                     Err(e) => {

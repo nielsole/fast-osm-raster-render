@@ -10,8 +10,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let args: Vec<String> = env::args().collect();
     if args.len() < 5 {
-        eprintln!("Usage: {} <osm-file.pbf> <z> <x> <y> [output.png] [--simple-shader|--debug-shader]", args[0]);
+        eprintln!("Usage: {} <osm-file.pbf> <z> <x> <y> [output.png] [--simple-shader|--debug-shader|--styled-shader]", args[0]);
         eprintln!("Example: {} prepared.osm.pbf 11 1081 660 hamburg.png", args[0]);
+        eprintln!("  --styled-shader: Use MapCSS styling (renders primary roads in red)");
         std::process::exit(1);
     }
 
@@ -25,6 +26,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         ShaderType::Simple
     } else if args.iter().any(|s| s == "--debug-shader") {
         ShaderType::Debug
+    } else if args.iter().any(|s| s == "--styled-shader") {
+        ShaderType::Styled
     } else {
         ShaderType::Mercator
     };
@@ -44,6 +47,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Create renderer
     log::info!("Creating {:?} shader renderer...", shader_type);
     let mut renderer = VulkanRenderer::new(tile_index.max_points, shader_type)?;
+
+    // Phase 0: Set test MapCSS stylesheet for styled shader
+    if shader_type == ShaderType::Styled {
+        log::info!("Setting MapCSS stylesheet: way[highway=primary] {{ color: #ff0000; }}");
+        renderer.set_stylesheet("way[highway=primary] { color: #ff0000; }")
+            .expect("Failed to set stylesheet");
+        renderer.set_data_file_path(temp_file.path().to_string_lossy().to_string());
+    }
 
     // Render tile
     let tile = Tile::new(x, y, z);

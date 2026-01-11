@@ -13,6 +13,8 @@ pub struct AppState {
     pub data: Arc<TileIndex>,
     pub mmap: Arc<MappedData>,
     pub shader_type: ShaderType,
+    pub data_file_path: String, // Phase 0: Path to data file for MapCSS
+    pub stylesheet: Option<String>, // Phase 0: Optional MapCSS stylesheet
 }
 
 pub fn create_app(state: AppState) -> Router {

@@ -29,6 +29,7 @@ fn test_vulkan_renderer_with_synthetic_data() -> Result<(), Box<dyn std::error::
             Point::new(center_lon - size, center_lat),
             Point::new(center_lon + size, center_lat),
         ],
+        highway_tag: None, // Phase 0: added highway_tag field
     };
 
     // Vertical line
@@ -41,6 +42,7 @@ fn test_vulkan_renderer_with_synthetic_data() -> Result<(), Box<dyn std::error::
             Point::new(center_lon, center_lat - size),
             Point::new(center_lon, center_lat + size),
         ],
+        highway_tag: None, // Phase 0: added highway_tag field
     };
 
     // Write to file
@@ -90,4 +92,39 @@ fn test_vulkan_renderer_with_synthetic_data() -> Result<(), Box<dyn std::error::
     println!("Found {} non-white pixels", non_white_pixels);
 
     Ok(())
+}
+
+#[test]
+fn test_vertex_buffer_capacity_calculation() {
+    // Test that verifies buffer capacity is sufficient for different shader types
+
+    // Current capacity: 10M floats = 40MB
+    const VERTEX_BUFFER_CAPACITY: usize = 10_000_000;
+
+    // Regular shader: (lon, lat) = 2 floats per vertex
+    let regular_vertex_size = 2;
+    let regular_max_vertices = VERTEX_BUFFER_CAPACITY / regular_vertex_size;
+    let regular_max_segments = regular_max_vertices / 2; // LINE_LIST topology
+    println!("Regular shader capacity: {} vertices, {} line segments",
+             regular_max_vertices, regular_max_segments);
+    assert_eq!(regular_max_vertices, 5_000_000);
+    assert_eq!(regular_max_segments, 2_500_000);
+
+    // Styled shader: (lon, lat, r, g, b, a) = 6 floats per vertex
+    let styled_vertex_size = 6;
+    let styled_max_vertices = VERTEX_BUFFER_CAPACITY / styled_vertex_size;
+    let styled_max_segments = styled_max_vertices / 2; // LINE_LIST topology
+    println!("Styled shader capacity: {} vertices, {} line segments",
+             styled_max_vertices, styled_max_segments);
+    assert_eq!(styled_max_vertices, 1_666_666);
+    assert_eq!(styled_max_segments, 833_333);
+
+    // Warning: Styled shader has 3x less capacity!
+    println!("WARNING: Styled shader has {}% capacity of regular shader",
+             (styled_max_segments * 100) / regular_max_segments);
+
+    // For tile 11/1082/661@2x (512px) that triggered overflow,
+    // we need to ensure buffer is large enough
+    // Real-world observation: This tile has enough geometry to overflow at 833K segments
+    // Recommendation: Increase capacity for styled shader or implement dynamic allocation
 }

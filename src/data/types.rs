@@ -154,6 +154,8 @@ pub type MapObjectOffset = u64;
 pub struct MapObject {
     pub bounding_box: BoundingBox,
     pub points: Vec<Point>,
+    /// Phase 0: Store highway tag only (Phase 1 will expand to full HashMap)
+    pub highway_tag: Option<String>,
 }
 
 impl MapObject {
@@ -161,6 +163,20 @@ impl MapObject {
         MapObject {
             bounding_box,
             points,
+            highway_tag: None,
+        }
+    }
+
+    /// Create a map object with a highway tag (Phase 0)
+    pub fn with_highway_tag(
+        bounding_box: BoundingBox,
+        points: Vec<Point>,
+        highway_tag: Option<String>,
+    ) -> Self {
+        MapObject {
+            bounding_box,
+            points,
+            highway_tag,
         }
     }
 }

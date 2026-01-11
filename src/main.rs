@@ -13,9 +13,10 @@ async fn main() -> anyhow::Result<()> {
     // Parse command line arguments
     let args: Vec<String> = env::args().collect();
     if args.len() < 2 {
-        eprintln!("Usage: {} <osm-file.pbf> [--simple-shader|--debug-shader]", args[0]);
+        eprintln!("Usage: {} <osm-file.pbf> [--simple-shader|--debug-shader|--styled-shader]", args[0]);
         eprintln!("  --simple-shader: Use simplified linear projection (better for debugging)");
         eprintln!("  --debug-shader: Output all vertices at center (pipeline test)");
+        eprintln!("  --styled-shader: Use MapCSS styling (Phase 0)");
         std::process::exit(1);
     }
 
@@ -24,6 +25,8 @@ async fn main() -> anyhow::Result<()> {
         ShaderType::Simple
     } else if args.iter().any(|s| s == "--debug-shader") {
         ShaderType::Debug
+    } else if args.iter().any(|s| s == "--styled-shader") {
+        ShaderType::Styled
     } else {
         ShaderType::Mercator
     };
@@ -61,11 +64,20 @@ async fn main() -> anyhow::Result<()> {
     let mmap_data = MappedData::new(temp_file_path)?;
     log::info!("Data file size: {} bytes", mmap_data.len());
 
+    // Phase 0: Set default MapCSS stylesheet for styled shader
+    let stylesheet = if shader_type == ShaderType::Styled {
+        Some("way[highway=primary] { color: #ff0000; }".to_string())
+    } else {
+        None
+    };
+
     // Create app state
     let app_state = AppState {
         data: Arc::new(tile_index),
         mmap: Arc::new(mmap_data),
         shader_type,
+        data_file_path: temp_file_path.to_string(),
+        stylesheet,
     };
 
     // Create HTTP server

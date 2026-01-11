@@ -10,6 +10,7 @@ pub enum ShaderType {
     Mercator,
     Simple,
     Debug,
+    Styled, // Phase 0: MapCSS styled rendering
 }
 
 /// Create a graphics pipeline for rendering lines
@@ -25,9 +26,15 @@ pub fn create_graphics_pipeline(
         ShaderType::Mercator => "shaders/tile.vert.spv",
         ShaderType::Simple => "shaders/tile_simple.vert.spv",
         ShaderType::Debug => "shaders/tile_debug.vert.spv",
+        ShaderType::Styled => "shaders/tile_styled.vert.spv", // Per-object: custom vertex shader
     };
     let vert_shader_module = create_shader_module(device, vert_path)?;
-    let frag_shader_module = create_shader_module(device, "shaders/tile.frag.spv")?;
+
+    let frag_path = match shader_type {
+        ShaderType::Styled => "shaders/tile_styled.frag.spv",
+        _ => "shaders/tile.frag.spv",
+    };
+    let frag_shader_module = create_shader_module(device, frag_path)?;
 
     let entry_point = std::ffi::CString::new("main").unwrap();
 
@@ -43,17 +50,43 @@ pub fn create_graphics_pipeline(
 
     let shader_stages = [vert_stage_info, frag_stage_info];
 
-    // Vertex input: 2 floats (lon, lat)
-    let vertex_binding_descriptions = [vk::VertexInputBindingDescription::default()
-        .binding(0)
-        .stride(8) // 2 * f32
-        .input_rate(vk::VertexInputRate::VERTEX)];
+    // Vertex input: depends on shader type
+    let (vertex_binding_descriptions, vertex_attribute_descriptions);
 
-    let vertex_attribute_descriptions = [vk::VertexInputAttributeDescription::default()
-        .binding(0)
-        .location(0)
-        .format(vk::Format::R32G32_SFLOAT)
-        .offset(0)];
+    if shader_type == ShaderType::Styled {
+        // Styled shader: (lon, lat, r, g, b, a) - 6 floats, 24 bytes
+        vertex_binding_descriptions = vec![vk::VertexInputBindingDescription::default()
+            .binding(0)
+            .stride(24) // 6 * f32
+            .input_rate(vk::VertexInputRate::VERTEX)];
+
+        vertex_attribute_descriptions = vec![
+            // Location 0: position (lon, lat)
+            vk::VertexInputAttributeDescription::default()
+                .binding(0)
+                .location(0)
+                .format(vk::Format::R32G32_SFLOAT)
+                .offset(0),
+            // Location 1: color (r, g, b, a)
+            vk::VertexInputAttributeDescription::default()
+                .binding(0)
+                .location(1)
+                .format(vk::Format::R32G32B32A32_SFLOAT)
+                .offset(8),
+        ];
+    } else {
+        // Default shaders: (lon, lat) - 2 floats, 8 bytes
+        vertex_binding_descriptions = vec![vk::VertexInputBindingDescription::default()
+            .binding(0)
+            .stride(8) // 2 * f32
+            .input_rate(vk::VertexInputRate::VERTEX)];
+
+        vertex_attribute_descriptions = vec![vk::VertexInputAttributeDescription::default()
+            .binding(0)
+            .location(0)
+            .format(vk::Format::R32G32_SFLOAT)
+            .offset(0)];
+    }
 
     let vertex_input_info = vk::PipelineVertexInputStateCreateInfo::default()
         .vertex_binding_descriptions(&vertex_binding_descriptions)
@@ -203,13 +236,14 @@ pub fn create_render_pass(
 pub fn create_descriptor_set_layout(
     device: &ash::Device,
 ) -> Result<vk::DescriptorSetLayout, vk::Result> {
-    let ubo_layout_binding = vk::DescriptorSetLayoutBinding::default()
-        .binding(0)
-        .descriptor_type(vk::DescriptorType::UNIFORM_BUFFER)
-        .descriptor_count(1)
-        .stage_flags(vk::ShaderStageFlags::VERTEX);
-
-    let bindings = [ubo_layout_binding];
+    let bindings = [
+        // Binding 0: Uniform buffer (bbox, tile_size, projection)
+        vk::DescriptorSetLayoutBinding::default()
+            .binding(0)
+            .descriptor_type(vk::DescriptorType::UNIFORM_BUFFER)
+            .descriptor_count(1)
+            .stage_flags(vk::ShaderStageFlags::VERTEX),
+    ];
 
     let layout_info = vk::DescriptorSetLayoutCreateInfo::default().bindings(&bindings);
 

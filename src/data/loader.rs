@@ -64,8 +64,20 @@ pub fn load_osm_data<P: AsRef<Path>>(
                     None => return,
                 };
 
-                // Create map object
-                let map_object = MapObject::new(bounding_box, points);
+                // Extract tags (Phase 0: only highway tag)
+                let tags: Vec<(String, String)> = way
+                    .tags()
+                    .map(|(k, v)| (k.to_string(), v.to_string()))
+                    .collect();
+
+                // Extract highway tag if present
+                let highway_tag = tags
+                    .iter()
+                    .find(|(k, _)| k == "highway")
+                    .map(|(_, v)| v.clone());
+
+                // Create map object with highway tag (Phase 0)
+                let map_object = MapObject::with_highway_tag(bounding_box, points, highway_tag);
 
                 // Update max points
                 tile_index.update_max_points(map_object.points.len());
@@ -79,11 +91,7 @@ pub fn load_osm_data<P: AsRef<Path>>(
                     }
                 };
 
-                // Get tags for filtering
-                let tags: Vec<(String, String)> = way
-                    .tags()
-                    .map(|(k, v)| (k.to_string(), v.to_string()))
-                    .collect();
+                // Check if this is an important way for zoom < 11 filtering
                 let is_important = is_important_way(&tags);
 
                 // Get all tiles that overlap with this way's bounding box

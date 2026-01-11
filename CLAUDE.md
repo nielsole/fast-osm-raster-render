@@ -2,6 +2,22 @@
 
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
+## ⚡ Performance Testing Requirements (READ THIS FIRST)
+
+**CRITICAL**: This project has STRICT performance requirements. See `.clauderules` for complete details.
+
+**All tiles MUST render in <50ms**
+
+When changing performance-critical code (renderer, mmap, style evaluation, shaders), you MUST:
+1. Run `cargo bench --bench tile_rendering`
+2. Update `PERFORMANCE.md` with results
+3. Include performance impact in commit message
+4. Verify <50ms target maintained
+
+**Current performance**: All tiles render in 11-16ms (well under 50ms target)
+
+See `PERFORMANCE.md` for current benchmark results and `.clauderules` for enforcement policy.
+
 ## Build and Run Commands
 
 ```bash
