@@ -190,7 +190,7 @@ fn pbf_metadata(path: &Path) -> io::Result<(u64, i64)> {
     Ok((size, mtime))
 }
 
-fn cache_paths(osm_path: &Path, max_z: u32) -> io::Result<(PathBuf, PathBuf, PathBuf)> {
+fn cache_paths(osm_path: &Path, max_z: u32) -> io::Result<(PathBuf, PathBuf, PathBuf, PathBuf)> {
     let cache_root = std::env::var("RUST_OSM_CACHE_DIR")
         .map(PathBuf::from)
         .unwrap_or_else(|_| PathBuf::from("/tmp/rust-osm-renderer-cache"));
@@ -210,7 +210,8 @@ fn cache_paths(osm_path: &Path, max_z: u32) -> io::Result<(PathBuf, PathBuf, Pat
     let data_cache_path = cache_root.join(format!("{}.cache.data", prefix));
     let meta_cache_path = cache_root.join(format!("{}.cache.meta", prefix));
     let index_cache_path = cache_root.join(format!("{}.cache.z{}.index", prefix, max_z));
-    Ok((data_cache_path, meta_cache_path, index_cache_path))
+    let toc_cache_path = cache_root.join(format!("{}.cache.z{}.toc", prefix, max_z));
+    Ok((data_cache_path, meta_cache_path, index_cache_path, toc_cache_path))
 }
 
 fn write_way_meta_cache<W: Write>(
@@ -308,7 +309,7 @@ fn build_tile_index_from_way_metas(
     tile_index.update_max_points(max_points);
     for partial in partial_indexes {
         for (key, offsets) in partial {
-            tile_index.tiles.entry(key).or_default().extend(offsets);
+            tile_index.insert_tile_key_offsets(key, offsets);
         }
     }
     tile_index
@@ -898,36 +899,51 @@ fn build_cache_from_raw_pbf(
 /// - data: `<name>-<hash>.cache.data` (independent of `max_z`)
 /// - meta: `<name>-<hash>.cache.meta` (way metadata for fast index rebuild)
 /// - index: `<name>-<hash>.cache.z<max_z>.index` (depends on zoom coverage)
+/// - toc: `<name>-<hash>.cache.z<max_z>.toc` (tile->offset table for fast lazy index startup)
 pub fn load_osm_data_cached<P: AsRef<Path>>(
     osm_path: P,
     max_z: u32,
 ) -> io::Result<(TileIndex, PathBuf)> {
     let osm_path = osm_path.as_ref();
-    let (data_cache_path, meta_cache_path, index_cache_path) = cache_paths(osm_path, max_z)?;
+    let (data_cache_path, meta_cache_path, index_cache_path, toc_cache_path) =
+        cache_paths(osm_path, max_z)?;
     log::info!(
-        "Cache paths: data={}, meta={}, index={}",
+        "Cache paths: data={}, meta={}, index={}, toc={}",
         data_cache_path.display(),
         meta_cache_path.display(),
-        index_cache_path.display()
+        index_cache_path.display(),
+        toc_cache_path.display()
     );
 
     let (pbf_size, pbf_mtime) = pbf_metadata(osm_path)?;
 
     // Fast path: direct index cache hit
     if data_cache_path.exists() && index_cache_path.exists() {
+        if !toc_cache_path.exists() {
+            log::info!("TOC cache missing, bootstrapping TOC from index cache...");
+            let _ = TileIndex::build_toc_from_index(
+                &index_cache_path,
+                &toc_cache_path,
+                pbf_size,
+                pbf_mtime,
+            );
+        }
         let cache_start = Instant::now();
-        if let Ok(mut index_file) = File::open(&index_cache_path) {
-            if let Ok(Some(tile_index)) =
-                TileIndex::read_from(&mut index_file, pbf_size, pbf_mtime)
-            {
-                log::info!(
-                    "Loaded from cache in {}ms ({} tiles, max {} points)",
-                    cache_start.elapsed().as_millis(),
-                    tile_index.len(),
-                    tile_index.max_points,
-                );
-                return Ok((tile_index, data_cache_path));
-            }
+        if let Ok(Some(tile_index)) =
+            TileIndex::read_from_mmap_with_toc(
+                &index_cache_path,
+                &toc_cache_path,
+                pbf_size,
+                pbf_mtime,
+            )
+        {
+            log::info!(
+                "Loaded from cache in {}ms ({} tiles, max {} points)",
+                cache_start.elapsed().as_millis(),
+                tile_index.len(),
+                tile_index.max_points,
+            );
+            return Ok((tile_index, data_cache_path));
         }
         log::info!("Index cache invalid (or stale), trying metadata cache...");
     }
@@ -955,8 +971,15 @@ pub fn load_osm_data_cached<P: AsRef<Path>>(
                 );
 
                 let mut index_file = BufWriter::new(File::create(&index_cache_path)?);
-                tile_index.write_to(&mut index_file, pbf_size, pbf_mtime)?;
+                let mut toc_file = BufWriter::new(File::create(&toc_cache_path)?);
+                tile_index.write_to_with_toc(
+                    &mut index_file,
+                    &mut toc_file,
+                    pbf_size,
+                    pbf_mtime,
+                )?;
                 index_file.flush()?;
+                toc_file.flush()?;
 
                 return Ok((tile_index, data_cache_path));
             }
@@ -1008,8 +1031,10 @@ pub fn load_osm_data_cached<P: AsRef<Path>>(
     log::info!("Phase 3: Caching tile index...");
     let cache_start = Instant::now();
     let mut index_file = BufWriter::new(File::create(&index_cache_path)?);
-    tile_index.write_to(&mut index_file, pbf_size, pbf_mtime)?;
+    let mut toc_file = BufWriter::new(File::create(&toc_cache_path)?);
+    tile_index.write_to_with_toc(&mut index_file, &mut toc_file, pbf_size, pbf_mtime)?;
     index_file.flush()?;
+    toc_file.flush()?;
 
     log::info!(
         "Phase 3 complete: index cached in {}ms",

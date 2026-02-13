@@ -211,7 +211,8 @@ impl VulkanRenderer {
         }
 
         // Build vertex buffer (per-object styling handled inside)
-        let vertex_count = self.build_vertex_buffer(&offsets, mmap_data, &bbox, tile.z, tile)?;
+        let vertex_count =
+            self.build_vertex_buffer(offsets.as_ref().as_slice(), mmap_data, &bbox, tile.z, tile)?;
 
         log::info!("Built vertex buffer with {} vertices", vertex_count);
 
