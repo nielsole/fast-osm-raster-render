@@ -57,16 +57,6 @@ fn has_area_tag(tags: &[(String, String)]) -> bool {
     false
 }
 
-/// Intermediate struct for parallel PBF processing.
-/// Holds extracted data from a Way element without any file I/O.
-struct ProcessedWay {
-    bbox: BoundingBox,
-    points: Vec<Point>,
-    is_area: bool,
-    tags: Vec<(String, String)>,
-    is_important: bool,
-}
-
 /// Metadata about a written way, used for building the tile index.
 struct WayMeta {
     offset: u64,
@@ -223,99 +213,92 @@ pub fn load_osm_data_cached<P: AsRef<Path>>(
     // Cache miss — build from scratch
     let total_start = Instant::now();
 
-    // Phase 1: Parallel PBF parsing
-    log::info!("Phase 1: Parsing PBF in parallel...");
-    let parse_start = Instant::now();
+    // Phase 1: Parse and write in one streaming pass.
+    // This avoids building a giant in-memory Vec<ProcessedWay> first.
+    log::info!("Phase 1: Parsing PBF and writing binary data (streaming)...");
+    let phase1_start = Instant::now();
     let reader = ElementReader::from_path(osm_path)
-        .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+        .map_err(io::Error::other)?;
 
-    let ways: Vec<ProcessedWay> = reader
-        .par_map_reduce(
-            |element| {
-                let mut ways = Vec::new();
-                if let Element::Way(way) = element {
-                    let points: Vec<Point> = way
-                        .node_locations()
-                        .map(|loc| Point::new(loc.lon(), loc.lat()))
-                        .collect();
-
-                    if points.is_empty() {
-                        return ways;
-                    }
-
-                    let bbox = match BoundingBox::from_points(&points) {
-                        Some(bbox) => bbox,
-                        None => return ways,
-                    };
-
-                    let tags: Vec<(String, String)> = way
-                        .tags()
-                        .map(|(k, v)| (k.to_string(), v.to_string()))
-                        .collect();
-
-                    let is_closed = points.len() >= 4
-                        && (points.first().unwrap().lon - points.last().unwrap().lon).abs() < 1e-10
-                        && (points.first().unwrap().lat - points.last().unwrap().lat).abs() < 1e-10;
-
-                    let is_area = is_closed && has_area_tag(&tags);
-                    let important = is_important(&tags);
-
-                    ways.push(ProcessedWay {
-                        bbox,
-                        points,
-                        is_area,
-                        tags,
-                        is_important: important,
-                    });
-                }
-                ways
-            },
-            Vec::new,
-            |mut a, b| {
-                a.extend(b);
-                a
-            },
-        )
-        .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
-
-    log::info!(
-        "Phase 1 complete: {} ways parsed in {}ms",
-        ways.len(),
-        parse_start.elapsed().as_millis()
-    );
-
-    // Phase 2: Serial binary data write
-    log::info!("Phase 2: Writing binary data...");
-    let write_start = Instant::now();
     let data_file = File::create(&data_cache_path)?;
     let mut writer = BufWriter::new(data_file);
+    let mut way_count: u64 = 0;
     let mut max_points: usize = 0;
+    let mut way_metas: Vec<WayMeta> = Vec::new();
 
-    let mut way_metas = Vec::with_capacity(ways.len());
-    for way in &ways {
-        let obj = MapObject::new(way.bbox, way.points.clone(), way.is_area, way.tags.clone());
-        if obj.points.len() > max_points {
-            max_points = obj.points.len();
-        }
-        let offset = write_map_object(&mut writer, &obj)?;
-        way_metas.push(WayMeta {
-            offset,
-            bbox: way.bbox,
-            is_important: way.is_important,
-        });
-    }
+    reader
+        .for_each(|element| {
+            if let Element::Way(way) = element {
+                let points: Vec<Point> = way
+                    .node_locations()
+                    .map(|loc| Point::new(loc.lon(), loc.lat()))
+                    .collect();
+
+                if points.is_empty() {
+                    return;
+                }
+
+                let bbox = match BoundingBox::from_points(&points) {
+                    Some(b) => b,
+                    None => return,
+                };
+
+                let tags: Vec<(String, String)> = way
+                    .tags()
+                    .map(|(k, v)| (k.to_string(), v.to_string()))
+                    .collect();
+
+                let first = &points[0];
+                let last = &points[points.len() - 1];
+                let is_closed = points.len() >= 4
+                    && (first.lon - last.lon).abs() < 1e-10
+                    && (first.lat - last.lat).abs() < 1e-10;
+                let is_area = is_closed && has_area_tag(&tags);
+                let important = is_important(&tags);
+
+                let points_len = points.len();
+                let map_object = MapObject::new(bbox, points, is_area, tags);
+                let offset = match write_map_object(&mut writer, &map_object) {
+                    Ok(o) => o,
+                    Err(e) => {
+                        log::error!("Failed to write map object: {}", e);
+                        return;
+                    }
+                };
+
+                if points_len > max_points {
+                    max_points = points_len;
+                }
+                way_metas.push(WayMeta {
+                    offset,
+                    bbox,
+                    is_important: important,
+                });
+
+                way_count += 1;
+                if way_count.is_multiple_of(100_000) {
+                    let elapsed_ms = phase1_start.elapsed().as_millis();
+                    log::info!(
+                        "Phase 1 progress: {} ways parsed/written ({}ms elapsed)",
+                        way_count,
+                        elapsed_ms
+                    );
+                }
+            }
+        })
+        .map_err(io::Error::other)?;
+
     writer.flush()?;
     drop(writer);
-    drop(ways); // Free memory before building index
 
     log::info!(
-        "Phase 2 complete: {} ways written in {}ms",
-        way_metas.len(),
-        write_start.elapsed().as_millis()
+        "Phase 1 complete: {} ways parsed/written in {}ms",
+        way_count,
+        phase1_start.elapsed().as_millis()
     );
 
-    // Phase 3: Parallel tile index building
-    log::info!("Phase 3: Building tile index in parallel...");
+    // Phase 2: Parallel tile index building
+    log::info!("Phase 2: Building tile index in parallel...");
     let index_start = Instant::now();
 
     let chunk_size = 10_000.max(way_metas.len() / rayon::current_num_threads() / 4);
@@ -353,20 +336,20 @@ pub fn load_osm_data_cached<P: AsRef<Path>>(
     }
 
     log::info!(
-        "Phase 3 complete: {} tile entries in {}ms",
+        "Phase 2 complete: {} tile entries in {}ms",
         tile_index.len(),
         index_start.elapsed().as_millis()
     );
 
-    // Phase 4: Cache tile index to disk
-    log::info!("Phase 4: Caching tile index...");
+    // Phase 3: Cache tile index to disk
+    log::info!("Phase 3: Caching tile index...");
     let cache_start = Instant::now();
     let mut index_file = BufWriter::new(File::create(&index_cache_path)?);
     tile_index.write_to(&mut index_file, pbf_size, pbf_mtime)?;
     index_file.flush()?;
 
     log::info!(
-        "Phase 4 complete: index cached in {}ms",
+        "Phase 3 complete: index cached in {}ms",
         cache_start.elapsed().as_millis()
     );
 
