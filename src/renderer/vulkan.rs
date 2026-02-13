@@ -88,14 +88,26 @@ fn create_instance(entry: &ash::Entry) -> Result<ash::Instance, VulkanError> {
         .engine_version(vk::make_api_version(0, 1, 0, 0))
         .api_version(vk::API_VERSION_1_2);
 
-    // Enable validation layers in debug mode
+    // Enable validation layer in debug builds only when available on this system.
     #[cfg(debug_assertions)]
-    let layer_names = vec![std::ffi::CString::new("VK_LAYER_KHRONOS_validation").unwrap()];
+    let desired_layer = std::ffi::CString::new("VK_LAYER_KHRONOS_validation").unwrap();
     #[cfg(debug_assertions)]
-    let layer_names_raw: Vec<*const c_char> = layer_names
-        .iter()
-        .map(|name| name.as_ptr())
-        .collect();
+    let layer_names_raw: Vec<*const c_char> = {
+        let available_layers = unsafe { entry.enumerate_instance_layer_properties()? };
+        let has_validation_layer = available_layers.iter().any(|layer| {
+            let layer_name = unsafe { CStr::from_ptr(layer.layer_name.as_ptr()) };
+            layer_name == desired_layer.as_c_str()
+        });
+
+        if has_validation_layer {
+            vec![desired_layer.as_ptr()]
+        } else {
+            log::warn!(
+                "VK_LAYER_KHRONOS_validation requested in debug build but not installed; continuing without validation layer"
+            );
+            vec![]
+        }
+    };
 
     #[cfg(not(debug_assertions))]
     let layer_names_raw: Vec<*const c_char> = vec![];
