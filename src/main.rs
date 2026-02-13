@@ -5,6 +5,20 @@ use rust_osm_renderer::server::{create_app, AppState};
 use std::env;
 use std::path::Path;
 use std::sync::Arc;
+use std::time::Instant;
+
+fn print_usage(program: &str) {
+    eprintln!(
+        "Usage: {} <osm-file.pbf> [--simple-shader|--debug-shader|--styled-shader] [--load-stats-only]",
+        program
+    );
+    eprintln!("  --simple-shader: Use simplified linear projection (better for debugging)");
+    eprintln!("  --debug-shader: Output all vertices at center (pipeline test)");
+    eprintln!("  --styled-shader: Use MapCSS styling");
+    eprintln!(
+        "  --load-stats-only: Load/cache data, print startup timings, then exit without starting HTTP server"
+    );
+}
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -13,24 +27,47 @@ async fn main() -> anyhow::Result<()> {
     // Parse command line arguments
     let args: Vec<String> = env::args().collect();
     if args.len() < 2 {
-        eprintln!("Usage: {} <osm-file.pbf> [--simple-shader|--debug-shader|--styled-shader]", args[0]);
-        eprintln!("  --simple-shader: Use simplified linear projection (better for debugging)");
-        eprintln!("  --debug-shader: Output all vertices at center (pipeline test)");
-        eprintln!("  --styled-shader: Use MapCSS styling (Phase 0)");
+        print_usage(&args[0]);
         std::process::exit(1);
     }
 
-    let osm_path = &args[1];
-    let shader_type = if args.iter().any(|s| s == "--simple-shader") {
-        ShaderType::Simple
-    } else if args.iter().any(|s| s == "--debug-shader") {
-        ShaderType::Debug
-    } else if args.iter().any(|s| s == "--styled-shader") {
-        ShaderType::Styled
-    } else {
-        ShaderType::Mercator
+    let mut osm_path: Option<String> = None;
+    let mut shader_type = ShaderType::Mercator;
+    let mut load_stats_only = false;
+
+    for arg in args.iter().skip(1) {
+        match arg.as_str() {
+            "--simple-shader" => shader_type = ShaderType::Simple,
+            "--debug-shader" => shader_type = ShaderType::Debug,
+            "--styled-shader" => shader_type = ShaderType::Styled,
+            "--load-stats-only" => load_stats_only = true,
+            _ if arg.starts_with("--") => {
+                eprintln!("Error: unknown flag: {}", arg);
+                print_usage(&args[0]);
+                std::process::exit(1);
+            }
+            _ => {
+                if osm_path.is_none() {
+                    osm_path = Some(arg.clone());
+                } else {
+                    eprintln!("Error: multiple OSM file paths provided");
+                    print_usage(&args[0]);
+                    std::process::exit(1);
+                }
+            }
+        }
+    }
+
+    let osm_path = match osm_path {
+        Some(p) => p,
+        None => {
+            eprintln!("Error: missing OSM file path");
+            print_usage(&args[0]);
+            std::process::exit(1);
+        }
     };
-    if !Path::new(osm_path).exists() {
+
+    if !Path::new(&osm_path).exists() {
         eprintln!("Error: OSM file not found: {}", osm_path);
         std::process::exit(1);
     }
@@ -42,7 +79,10 @@ async fn main() -> anyhow::Result<()> {
     // We index up to zoom 15, but can render higher zoom levels by using parent tiles
     let max_z = 15;
     log::info!("Loading OSM data (max zoom: {})...", max_z);
-    let (tile_index, data_path) = load_osm_data_cached(osm_path, max_z)?;
+    let startup_start = Instant::now();
+    let load_start = Instant::now();
+    let (tile_index, data_path) = load_osm_data_cached(&osm_path, max_z)?;
+    let load_ms = load_start.elapsed().as_millis();
 
     log::info!(
         "OSM data loaded: {} tiles, max {} points per way",
@@ -52,8 +92,33 @@ async fn main() -> anyhow::Result<()> {
 
     // Memory-map the data file
     log::info!("Memory-mapping data file...");
+    let mmap_start = Instant::now();
     let mmap_data = MappedData::new(&data_path)?;
+    let mmap_ms = mmap_start.elapsed().as_millis();
+    let total_ms = startup_start.elapsed().as_millis();
     log::info!("Data file size: {} bytes", mmap_data.len());
+    log::info!(
+        "Startup timing: load={}ms mmap={}ms total={}ms",
+        load_ms,
+        mmap_ms,
+        total_ms
+    );
+    println!(
+        "LOAD_STATS osm={} max_z={} tiles={} max_points={} data_bytes={} load_ms={} mmap_ms={} total_ms={}",
+        osm_path,
+        max_z,
+        tile_index.len(),
+        tile_index.max_points,
+        mmap_data.len(),
+        load_ms,
+        mmap_ms,
+        total_ms
+    );
+
+    if load_stats_only {
+        log::info!("Load stats only mode: exiting before server startup");
+        return Ok(());
+    }
 
     // Set default MapCSS stylesheet for styled shader
     let stylesheet = if shader_type == ShaderType::Styled {
