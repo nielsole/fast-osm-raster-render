@@ -138,7 +138,18 @@ fn zoom_range(input: &str) -> IResult<&str, ZoomRange> {
 
     // Parse optional min zoom
     let (rest, min_str) = opt(take_while1(|c: char| c.is_ascii_digit()))(rest)?;
-    let min = min_str.map(|s: &str| s.parse::<u32>().unwrap());
+    let min = match min_str {
+        Some(s) => match s.parse::<u32>() {
+            Ok(v) => Some(v),
+            Err(_) => {
+                return Err(nom::Err::Error(nom::error::Error::new(
+                    input,
+                    nom::error::ErrorKind::Digit,
+                )))
+            }
+        },
+        None => None,
+    };
 
     // Check for dash (range separator)
     let (rest, has_dash) = opt(char('-'))(rest)?;
@@ -146,7 +157,18 @@ fn zoom_range(input: &str) -> IResult<&str, ZoomRange> {
     if has_dash.is_some() {
         // Parse optional max zoom after dash
         let (rest, max_str) = opt(take_while1(|c: char| c.is_ascii_digit()))(rest)?;
-        let max = max_str.map(|s: &str| s.parse::<u32>().unwrap());
+        let max = match max_str {
+            Some(s) => match s.parse::<u32>() {
+                Ok(v) => Some(v),
+                Err(_) => {
+                    return Err(nom::Err::Error(nom::error::Error::new(
+                        input,
+                        nom::error::ErrorKind::Digit,
+                    )))
+                }
+            },
+            None => None,
+        };
         Ok((rest, ZoomRange { min, max }))
     } else {
         // Single zoom level: |z14 means min=14, max=14
@@ -544,5 +566,11 @@ mod tests {
         assert_eq!(stylesheet.rules[0].selector.zoom_range, Some(ZoomRange { min: Some(6), max: None }));
         assert_eq!(stylesheet.rules[1].selector.zoom_range, Some(ZoomRange { min: Some(8), max: None }));
         assert_eq!(stylesheet.rules[3].selector.zoom_range, None); // catch-all
+    }
+
+    #[test]
+    fn test_zoom_range_overflow_does_not_panic() {
+        let bad = "way|z42949672960[highway=primary] { color: #ff0000; }";
+        assert!(parse_mapcss(bad).is_err());
     }
 }

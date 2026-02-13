@@ -188,14 +188,16 @@ fn pbf_metadata(path: &Path) -> io::Result<(u64, i64)> {
 /// caches everything to disk.
 /// On subsequent runs: loads cache in seconds if PBF file hasn't changed.
 ///
-/// Cache files are stored alongside the PBF: `<path>.cache.data` and `<path>.cache.index`.
+/// Cache files are stored alongside the PBF:
+/// - data: `<path>.cache.data` (independent of `max_z`)
+/// - index: `<path>.cache.z<max_z>.index` (depends on zoom coverage)
 pub fn load_osm_data_cached<P: AsRef<Path>>(
     osm_path: P,
     max_z: u32,
 ) -> io::Result<(TileIndex, PathBuf)> {
     let osm_path = osm_path.as_ref();
     let data_cache_path = PathBuf::from(format!("{}.cache.data", osm_path.display()));
-    let index_cache_path = PathBuf::from(format!("{}.cache.index", osm_path.display()));
+    let index_cache_path = PathBuf::from(format!("{}.cache.z{}.index", osm_path.display(), max_z));
 
     let (pbf_size, pbf_mtime) = pbf_metadata(osm_path)?;
 
