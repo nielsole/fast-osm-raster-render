@@ -38,6 +38,9 @@ nom = "7.1"
 # Polygon triangulation
 earcutr = "0.4"
 
+# Font rasterization for label rendering
+fontdue = "0.9"
+
 [build-dependencies]
 shaderc = "0.8"
 

@@ -74,6 +74,8 @@ pub struct ZoomRange {
 pub enum Declaration {
     Color(Color),
     FillColor(Color),
+    CasingColor(Color),
+    CasingWidth(f32),
     Width(f32),
     Opacity(f32),
     ZIndex(i32),

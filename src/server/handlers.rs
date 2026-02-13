@@ -1,5 +1,6 @@
 use crate::data::types::Tile;
 use crate::encoding::png::encode_png;
+use crate::labels::render_place_labels;
 use crate::renderer::{VulkanRenderer, ShaderType};
 use crate::renderer::pipeline::{TILE_SIZE, TILE_SIZE_2X};
 use crate::server::AppState;
@@ -31,6 +32,24 @@ pub async fn handle_tile_request(
     log::info!("Rendering tile {}/{}/{} at {}px", z, x, y, tile_size);
 
     let tile = Tile::new(x, y, z);
+    let use_low_zoom = tile.z <= state.low_zoom_max
+        && state.low_zoom_index.is_some()
+        && state.low_zoom_data.is_some();
+    let (active_index, active_mmap) = if use_low_zoom {
+        (
+            state.low_zoom_index.as_ref().unwrap().as_ref(),
+            state.low_zoom_data.as_ref().unwrap().as_ref(),
+        )
+    } else {
+        (state.data.as_ref(), state.mmap.as_ref())
+    };
+    if use_low_zoom {
+        log::info!(
+            "Using simplified low-zoom dataset for tile {} (z<= {})",
+            tile,
+            state.low_zoom_max
+        );
+    }
 
     // Thread-local renderers for both 256px and 512px tiles
     thread_local! {
@@ -39,7 +58,7 @@ pub async fn handle_tile_request(
     }
 
     // Choose the appropriate renderer based on tile size
-    let image = if tile_size == TILE_SIZE_2X {
+    let mut image = if tile_size == TILE_SIZE_2X {
         RENDERER_512.with(|renderer_cell| {
             let mut renderer_opt = renderer_cell.lock().unwrap();
 
@@ -67,7 +86,7 @@ pub async fn handle_tile_request(
 
             let renderer = renderer_opt.as_mut().unwrap();
             renderer
-                .render_tile(&tile, &state.data, &state.mmap)
+                .render_tile(&tile, active_index, active_mmap)
                 .map_err(|e| {
                     log::error!("Failed to render 512px tile: {}", e);
                     StatusCode::INTERNAL_SERVER_ERROR
@@ -101,13 +120,16 @@ pub async fn handle_tile_request(
 
             let renderer = renderer_opt.as_mut().unwrap();
             renderer
-                .render_tile(&tile, &state.data, &state.mmap)
+                .render_tile(&tile, active_index, active_mmap)
                 .map_err(|e| {
                     log::error!("Failed to render 256px tile: {}", e);
                     StatusCode::INTERNAL_SERVER_ERROR
                 })
         })?
     };
+
+    // CPU label overlay (place/city names), collision-aware.
+    render_place_labels(&tile, &mut image, &state.labels);
 
     // Encode to PNG
     let png_data = encode_png(&image).map_err(|e| {

@@ -49,14 +49,12 @@
                         type: 'raster',
                         source: 'osm-tiles',
                         minzoom: 0,
-                        maxzoom: 22,
-                        paint: {
-                            'raster-resampling': 'nearest'
-                        }
+                        maxzoom: 22
                     }]
                 },
                 // Performance settings
                 hash: true,  // URL hash for sharing
+                zoomSnap: 1,  // Snap zoom interactions to full integer levels
                 fadeDuration: 0,  // No fade animation - instant display
                 attributionControl: true
             });

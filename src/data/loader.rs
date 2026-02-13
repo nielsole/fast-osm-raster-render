@@ -9,7 +9,7 @@ use rayon::prelude::*;
 use std::collections::hash_map::DefaultHasher;
 use std::collections::HashMap;
 use std::collections::BinaryHeap;
-use std::fs::File;
+use std::fs::{self, File};
 use std::io::{self, BufReader, BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
 use std::hash::{Hash, Hasher};
@@ -81,6 +81,10 @@ struct NodeCoord {
 
 const META_CACHE_MAGIC: &[u8; 8] = b"OSMMETA1";
 const NODE_RECORD_SIZE: usize = 16; // i64 node_id + i32 lon_dm7 + i32 lat_dm7
+const SIMPLIFIED_CACHE_VERSION: u32 = 1;
+const SIMPLIFIED_MIN_POINTS: usize = 24;
+const DEFAULT_CACHE_DIR: &str = ".osm-cache";
+const LEGACY_CACHE_DIR: &str = "/tmp/rust-osm-renderer-cache";
 
 /// Load OSM data from a PBF file and build spatial index (original sequential API).
 ///
@@ -190,12 +194,7 @@ fn pbf_metadata(path: &Path) -> io::Result<(u64, i64)> {
     Ok((size, mtime))
 }
 
-fn cache_paths(osm_path: &Path, max_z: u32) -> io::Result<(PathBuf, PathBuf, PathBuf, PathBuf)> {
-    let cache_root = std::env::var("RUST_OSM_CACHE_DIR")
-        .map(PathBuf::from)
-        .unwrap_or_else(|_| PathBuf::from("/tmp/rust-osm-renderer-cache"));
-    std::fs::create_dir_all(&cache_root)?;
-
+fn cache_prefix(osm_path: &Path) -> String {
     let canonical = std::fs::canonicalize(osm_path).unwrap_or_else(|_| osm_path.to_path_buf());
     let mut hasher = DefaultHasher::new();
     canonical.hash(&mut hasher);
@@ -205,13 +204,240 @@ fn cache_paths(osm_path: &Path, max_z: u32) -> io::Result<(PathBuf, PathBuf, Pat
         .file_stem()
         .and_then(|s| s.to_str())
         .unwrap_or("osm");
-    let prefix = format!("{}-{:016x}", stem, hash);
+    format!("{}-{:016x}", stem, hash)
+}
+
+fn copy_dir_recursive(src: &Path, dst: &Path) -> io::Result<()> {
+    fs::create_dir_all(dst)?;
+    for entry in fs::read_dir(src)? {
+        let entry = entry?;
+        let from = entry.path();
+        let to = dst.join(entry.file_name());
+        if from.is_dir() {
+            copy_dir_recursive(&from, &to)?;
+        } else if from.is_file() {
+            fs::copy(&from, &to)?;
+        }
+    }
+    Ok(())
+}
+
+fn move_with_copy_fallback(src: &Path, dst: &Path) -> io::Result<()> {
+    match fs::rename(src, dst) {
+        Ok(()) => Ok(()),
+        Err(e) if e.raw_os_error() == Some(18) => {
+            if src.is_dir() {
+                copy_dir_recursive(src, dst)?;
+                fs::remove_dir_all(src)?;
+            } else if src.is_file() {
+                fs::copy(src, dst)?;
+                fs::remove_file(src)?;
+            }
+            Ok(())
+        }
+        Err(e) => Err(e),
+    }
+}
+
+fn maybe_migrate_legacy_cache(cache_root: &Path) -> io::Result<()> {
+    if cache_root != Path::new(DEFAULT_CACHE_DIR) {
+        return Ok(());
+    }
+
+    let legacy_root = Path::new(LEGACY_CACHE_DIR);
+    if !legacy_root.exists() || !legacy_root.is_dir() {
+        return Ok(());
+    }
+
+    fs::create_dir_all(cache_root)?;
+    for entry in fs::read_dir(legacy_root)? {
+        let entry = entry?;
+        let src = entry.path();
+        let dst = cache_root.join(entry.file_name());
+        if dst.exists() {
+            continue;
+        }
+        move_with_copy_fallback(&src, &dst)?;
+    }
+
+    if fs::read_dir(legacy_root)?.next().is_none() {
+        let _ = fs::remove_dir(legacy_root);
+    }
+    Ok(())
+}
+
+fn cache_root_dir() -> io::Result<PathBuf> {
+    let cache_root = std::env::var("RUST_OSM_CACHE_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| PathBuf::from(DEFAULT_CACHE_DIR));
+    fs::create_dir_all(&cache_root)?;
+    maybe_migrate_legacy_cache(&cache_root)?;
+    Ok(cache_root)
+}
+
+fn cache_paths(osm_path: &Path, max_z: u32) -> io::Result<(PathBuf, PathBuf, PathBuf, PathBuf)> {
+    let cache_root = cache_root_dir()?;
+
+    let prefix = cache_prefix(osm_path);
 
     let data_cache_path = cache_root.join(format!("{}.cache.data", prefix));
     let meta_cache_path = cache_root.join(format!("{}.cache.meta", prefix));
     let index_cache_path = cache_root.join(format!("{}.cache.z{}.index", prefix, max_z));
     let toc_cache_path = cache_root.join(format!("{}.cache.z{}.toc", prefix, max_z));
     Ok((data_cache_path, meta_cache_path, index_cache_path, toc_cache_path))
+}
+
+fn low_zoom_cache_paths(
+    osm_path: &Path,
+    low_zoom_max: u32,
+) -> io::Result<(PathBuf, PathBuf, PathBuf)> {
+    let cache_root = cache_root_dir()?;
+    let prefix = cache_prefix(osm_path);
+    let suffix = format!(
+        "{}.cache.lowz{}.v{}",
+        prefix, low_zoom_max, SIMPLIFIED_CACHE_VERSION
+    );
+    let data_cache_path = cache_root.join(format!("{}.data", suffix));
+    let index_cache_path = cache_root.join(format!("{}.index", suffix));
+    let toc_cache_path = cache_root.join(format!("{}.toc", suffix));
+    Ok((data_cache_path, index_cache_path, toc_cache_path))
+}
+
+#[inline(always)]
+fn mercator_unit_x(lon: f64) -> f64 {
+    (lon + 180.0) / 360.0
+}
+
+#[inline(always)]
+fn mercator_unit_y(lat: f64) -> f64 {
+    let clamped = lat.clamp(-85.05112878, 85.05112878);
+    let rad = clamped.to_radians();
+    (1.0 - ((rad.tan() + 1.0 / rad.cos()).ln() / std::f64::consts::PI)) * 0.5
+}
+
+#[inline(always)]
+fn sqr(v: f64) -> f64 {
+    v * v
+}
+
+fn perpendicular_distance_sq_px(p: Point, a: Point, b: Point, zoom: u32) -> f64 {
+    let scale = 256.0 * 2f64.powi(zoom as i32);
+    let px = mercator_unit_x(p.lon) * scale;
+    let py = mercator_unit_y(p.lat) * scale;
+    let ax = mercator_unit_x(a.lon) * scale;
+    let ay = mercator_unit_y(a.lat) * scale;
+    let bx = mercator_unit_x(b.lon) * scale;
+    let by = mercator_unit_y(b.lat) * scale;
+
+    let abx = bx - ax;
+    let aby = by - ay;
+    let len_sq = abx * abx + aby * aby;
+    if len_sq <= 1e-12 {
+        return sqr(px - ax) + sqr(py - ay);
+    }
+
+    let t = (((px - ax) * abx + (py - ay) * aby) / len_sq).clamp(0.0, 1.0);
+    let proj_x = ax + t * abx;
+    let proj_y = ay + t * aby;
+    sqr(px - proj_x) + sqr(py - proj_y)
+}
+
+fn mark_sharp_turns(points: &[Point], keep: &mut [bool], min_turn_deg: f64) {
+    if points.len() < 3 {
+        return;
+    }
+    let cos_limit = (180.0 - min_turn_deg).to_radians().cos();
+    for i in 1..(points.len() - 1) {
+        let a = points[i - 1];
+        let b = points[i];
+        let c = points[i + 1];
+        let v1x = b.lon - a.lon;
+        let v1y = b.lat - a.lat;
+        let v2x = c.lon - b.lon;
+        let v2y = c.lat - b.lat;
+        let n1 = (v1x * v1x + v1y * v1y).sqrt();
+        let n2 = (v2x * v2x + v2y * v2y).sqrt();
+        if n1 <= 1e-12 || n2 <= 1e-12 {
+            continue;
+        }
+        let cos_angle = ((v1x * v2x + v1y * v2y) / (n1 * n2)).clamp(-1.0, 1.0);
+        if cos_angle > cos_limit {
+            continue;
+        }
+        keep[i] = true;
+    }
+}
+
+fn simplify_segment_rdp(
+    points: &[Point],
+    keep: &mut [bool],
+    start: usize,
+    end: usize,
+    tol_sq: f64,
+    zoom: u32,
+) {
+    if end <= start + 1 {
+        return;
+    }
+    let mut stack = vec![(start, end)];
+    while let Some((s, e)) = stack.pop() {
+        if e <= s + 1 {
+            continue;
+        }
+        let a = points[s];
+        let b = points[e];
+        let mut max_dist = 0.0;
+        let mut idx = None;
+        for i in (s + 1)..e {
+            let d = perpendicular_distance_sq_px(points[i], a, b, zoom);
+            if d > max_dist {
+                max_dist = d;
+                idx = Some(i);
+            }
+        }
+        if let Some(i) = idx {
+            if max_dist > tol_sq {
+                keep[i] = true;
+                stack.push((s, i));
+                stack.push((i, e));
+            }
+        }
+    }
+}
+
+fn simplify_line_points(points: &[Point], zoom: u32) -> Vec<Point> {
+    if points.len() <= 2 {
+        return points.to_vec();
+    }
+
+    let tolerance_px = 1.0;
+    let tol_sq = tolerance_px * tolerance_px;
+    let mut keep = vec![false; points.len()];
+    keep[0] = true;
+    keep[points.len() - 1] = true;
+    mark_sharp_turns(points, &mut keep, 20.0);
+
+    let mut anchors: Vec<usize> = keep
+        .iter()
+        .enumerate()
+        .filter_map(|(i, &k)| if k { Some(i) } else { None })
+        .collect();
+    anchors.sort_unstable();
+
+    for w in anchors.windows(2) {
+        simplify_segment_rdp(points, &mut keep, w[0], w[1], tol_sq, zoom);
+    }
+
+    let simplified: Vec<Point> = points
+        .iter()
+        .enumerate()
+        .filter_map(|(i, p)| if keep[i] { Some(*p) } else { None })
+        .collect();
+    if simplified.len() < 2 {
+        points.to_vec()
+    } else {
+        simplified
+    }
 }
 
 fn write_way_meta_cache<W: Write>(
@@ -895,7 +1121,7 @@ fn build_cache_from_raw_pbf(
 /// caches everything to disk.
 /// On subsequent runs: loads cache in seconds if PBF file hasn't changed.
 ///
-/// Cache files are stored under `RUST_OSM_CACHE_DIR` (default: `/tmp/rust-osm-renderer-cache`):
+/// Cache files are stored under `RUST_OSM_CACHE_DIR` (default: `.osm-cache`):
 /// - data: `<name>-<hash>.cache.data` (independent of `max_z`)
 /// - meta: `<name>-<hash>.cache.meta` (way metadata for fast index rebuild)
 /// - index: `<name>-<hash>.cache.z<max_z>.index` (depends on zoom coverage)
@@ -1050,6 +1276,114 @@ pub fn load_osm_data_cached<P: AsRef<Path>>(
     );
 
     Ok((tile_index, data_cache_path))
+}
+
+/// Build/load a low-zoom simplified geometry cache (disk-backed) for faster rendering at z<=low_zoom_max.
+pub fn load_low_zoom_simplified_cached<P: AsRef<Path>>(
+    osm_path: P,
+    max_z: u32,
+    low_zoom_max: u32,
+) -> io::Result<Option<(TileIndex, PathBuf)>> {
+    let osm_path = osm_path.as_ref();
+    let (full_data_path, full_meta_path, _, _) = cache_paths(osm_path, max_z)?;
+    if !full_data_path.exists() || !full_meta_path.exists() {
+        return Ok(None);
+    }
+
+    let (low_data_path, low_index_path, low_toc_path) = low_zoom_cache_paths(osm_path, low_zoom_max)?;
+    let (pbf_size, pbf_mtime) = pbf_metadata(osm_path)?;
+
+    if low_data_path.exists() && low_index_path.exists() {
+        if !low_toc_path.exists() {
+            let _ = TileIndex::build_toc_from_index(&low_index_path, &low_toc_path, pbf_size, pbf_mtime);
+        }
+        if let Ok(Some(idx)) =
+            TileIndex::read_from_mmap_with_toc(&low_index_path, &low_toc_path, pbf_size, pbf_mtime)
+        {
+            log::info!(
+                "Loaded low-zoom simplified cache (z<= {}) with {} tiles",
+                low_zoom_max,
+                idx.len()
+            );
+            return Ok(Some((idx, low_data_path)));
+        }
+    }
+
+    log::info!("Building low-zoom simplified cache (z<= {})...", low_zoom_max);
+    let mut meta_reader = BufReader::new(File::open(&full_meta_path)?);
+    let (way_metas, _) = match read_way_meta_cache(&mut meta_reader, pbf_size, pbf_mtime)? {
+        Some(v) => v,
+        None => return Ok(None),
+    };
+
+    let source_mmap = super::mmap::MappedData::new(&full_data_path)?;
+    let mut writer = BufWriter::new(File::create(&low_data_path)?);
+    let mut simplified_metas = Vec::with_capacity(way_metas.len());
+    let mut max_points = 0usize;
+    let batch_size = std::env::var("RUST_OSM_LOWZ_BATCH")
+        .ok()
+        .and_then(|s| s.parse::<usize>().ok())
+        .filter(|&n| n > 0)
+        .unwrap_or(20_000);
+
+    for (batch_idx, chunk) in way_metas.chunks(batch_size).enumerate() {
+        let simplified_batch: Vec<Option<(MapObject, bool)>> = chunk
+            .par_iter()
+            .map(|meta| {
+                let view = source_mmap.read_map_object(meta.offset);
+                let points = view.points();
+                if points.len() < 2 {
+                    return None;
+                }
+
+                let mut out_points = if !view.is_area() && points.len() >= SIMPLIFIED_MIN_POINTS {
+                    simplify_line_points(points, low_zoom_max)
+                } else {
+                    points.to_vec()
+                };
+
+                if out_points.len() < 2 {
+                    out_points = points.to_vec();
+                }
+
+                let bbox = BoundingBox::from_points(&out_points)?;
+                let tags: Vec<(String, String)> = view.tags().into_iter().collect();
+                let obj = MapObject::new(bbox, out_points, view.is_area(), tags);
+                Some((obj, meta.is_important))
+            })
+            .collect();
+
+        for entry in simplified_batch.into_iter().flatten() {
+            let (obj, is_important) = entry;
+            max_points = max_points.max(obj.points.len());
+            let offset = write_map_object(&mut writer, &obj)?;
+            simplified_metas.push(WayMeta {
+                offset,
+                bbox: obj.bounding_box,
+                is_important,
+            });
+        }
+
+        let done = ((batch_idx + 1) * batch_size).min(way_metas.len());
+        if done.is_multiple_of(250_000) || done == way_metas.len() {
+            log::info!("Low-zoom simplify progress: {}/{} ways", done, way_metas.len());
+        }
+    }
+    writer.flush()?;
+
+    let tile_index = build_tile_index_from_way_metas(&simplified_metas, max_points, low_zoom_max);
+    let mut index_writer = BufWriter::new(File::create(&low_index_path)?);
+    let mut toc_writer = BufWriter::new(File::create(&low_toc_path)?);
+    tile_index.write_to_with_toc(&mut index_writer, &mut toc_writer, pbf_size, pbf_mtime)?;
+    index_writer.flush()?;
+    toc_writer.flush()?;
+
+    log::info!(
+        "Low-zoom simplified cache built: {} ways, {} tiles",
+        simplified_metas.len(),
+        tile_index.len()
+    );
+    Ok(Some((tile_index, low_data_path)))
 }
 
 #[cfg(test)]

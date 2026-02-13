@@ -13,6 +13,8 @@ use std::collections::HashMap;
 pub struct EvaluatedStyle {
     pub color: Option<super::Color>,
     pub fill_color: Option<super::Color>,
+    pub casing_color: Option<super::Color>,
+    pub casing_width: Option<f32>,
     pub width: Option<f32>,
     pub opacity: Option<f32>,
     pub z_index: Option<i32>,
@@ -23,6 +25,8 @@ impl Default for EvaluatedStyle {
         EvaluatedStyle {
             color: Some(super::Color::BLACK), // Default black
             fill_color: None,                 // No fill by default
+            casing_color: None,               // No casing by default
+            casing_width: None,
             width: Some(1.0),                 // Default 1px
             opacity: Some(1.0),               // Default opaque
             z_index: Some(0),                 // Default layer
@@ -212,6 +216,8 @@ fn apply_declarations(style: &mut EvaluatedStyle, declarations: &[Declaration]) 
         match decl {
             Declaration::Color(color) => style.color = Some(*color),
             Declaration::FillColor(color) => style.fill_color = Some(*color),
+            Declaration::CasingColor(color) => style.casing_color = Some(*color),
+            Declaration::CasingWidth(width) => style.casing_width = Some(*width),
             Declaration::Width(width) => style.width = Some(*width),
             Declaration::Opacity(opacity) => style.opacity = Some(*opacity),
             Declaration::ZIndex(z) => style.z_index = Some(*z),

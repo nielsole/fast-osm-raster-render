@@ -60,6 +60,9 @@ pub struct VulkanRenderer {
 
 struct RenderTarget {
     framebuffer: vk::Framebuffer,
+    msaa_color_image: vk::Image,
+    msaa_color_image_view: vk::ImageView,
+    msaa_color_image_allocation: Allocation,
     color_image: vk::Image,
     color_image_view: vk::ImageView,
     color_image_allocation: Allocation,
@@ -67,7 +70,14 @@ struct RenderTarget {
     staging_buffer_allocation: Allocation,
 }
 
+enum VertexBuildResult {
+    Complete(usize),
+    Overflow { needed_floats: usize },
+}
+
 impl VulkanRenderer {
+    const MSAA_SAMPLES: vk::SampleCountFlags = vk::SampleCountFlags::TYPE_4;
+
     /// Create a new Vulkan renderer
     pub fn new(max_points: usize, shader_type: ShaderType) -> Result<Self, VulkanError> {
         Self::new_with_tile_size(max_points, shader_type, TILE_SIZE)
@@ -76,7 +86,7 @@ impl VulkanRenderer {
     /// Create a new Vulkan renderer with custom tile size
     pub fn new_with_tile_size(max_points: usize, shader_type: ShaderType, tile_size: u32) -> Result<Self, VulkanError> {
         // Ensure we have a minimum buffer size even with no data
-        let max_points = max_points.max(1000); // Minimum 1000 points
+        let _max_points = max_points.max(1000); // Minimum 1000 points
 
         log::info!("Creating Vulkan renderer with {:?} shader", shader_type);
 
@@ -97,12 +107,17 @@ impl VulkanRenderer {
 
         // Create render pass and pipeline
         let descriptor_set_layout = create_descriptor_set_layout(&context.device)?;
-        let render_pass = create_render_pass(&context.device, vk::Format::R8G8B8A8_UNORM)?;
+        let render_pass = create_render_pass(
+            &context.device,
+            vk::Format::R8G8B8A8_UNORM,
+            Self::MSAA_SAMPLES,
+        )?;
         let (pipeline, pipeline_layout) = create_graphics_pipeline(
             &context.device,
             render_pass,
             descriptor_set_layout,
             shader_type,
+            Self::MSAA_SAMPLES,
             tile_size,
         )?;
 
@@ -210,9 +225,16 @@ impl VulkanRenderer {
             self.render_target = Some(self.create_render_target()?);
         }
 
-        // Build vertex buffer (per-object styling handled inside)
-        let vertex_count =
-            self.build_vertex_buffer(offsets.as_ref().as_slice(), mmap_data, &bbox, tile.z, tile)?;
+        // Build vertex buffer (per-object styling handled inside).
+        // Grow buffer and retry if this tile exceeds current capacity.
+        let vertex_count = loop {
+            match self.build_vertex_buffer(offsets.as_ref().as_slice(), mmap_data, &bbox, tile.z, tile)? {
+                VertexBuildResult::Complete(vertex_count) => break vertex_count,
+                VertexBuildResult::Overflow { needed_floats } => {
+                    self.grow_vertex_buffer(needed_floats)?;
+                }
+            }
+        };
 
         log::info!("Built vertex buffer with {} vertices", vertex_count);
 
@@ -253,12 +275,32 @@ impl VulkanRenderer {
         let mut allocator = self.memory_manager.lock().unwrap();
 
         // Create color image
+        let (msaa_color_image, msaa_color_image_allocation) = create_image(
+            &self.context.device,
+            &mut allocator,
+            self.tile_size,
+            self.tile_size,
+            vk::Format::R8G8B8A8_UNORM,
+            Self::MSAA_SAMPLES,
+            vk::ImageUsageFlags::COLOR_ATTACHMENT,
+            MemoryLocation::GpuOnly,
+            "msaa_color_image",
+        )?;
+
+        let msaa_color_image_view = create_image_view(
+            &self.context.device,
+            msaa_color_image,
+            vk::Format::R8G8B8A8_UNORM,
+        )?;
+
+        // Create resolve color image
         let (color_image, color_image_allocation) = create_image(
             &self.context.device,
             &mut allocator,
             self.tile_size,
             self.tile_size,
             vk::Format::R8G8B8A8_UNORM,
+            vk::SampleCountFlags::TYPE_1,
             vk::ImageUsageFlags::COLOR_ATTACHMENT | vk::ImageUsageFlags::TRANSFER_SRC,
             MemoryLocation::GpuOnly,
             "color_image",
@@ -272,7 +314,7 @@ impl VulkanRenderer {
         )?;
 
         // Create framebuffer
-        let attachments = [color_image_view];
+        let attachments = [msaa_color_image_view, color_image_view];
         let framebuffer_info = vk::FramebufferCreateInfo::default()
             .render_pass(self.render_pass)
             .attachments(&attachments)
@@ -297,6 +339,9 @@ impl VulkanRenderer {
 
         Ok(RenderTarget {
             framebuffer,
+            msaa_color_image,
+            msaa_color_image_view,
+            msaa_color_image_allocation,
             color_image,
             color_image_view,
             color_image_allocation,
@@ -312,7 +357,7 @@ impl VulkanRenderer {
         bbox: &BoundingBox,
         zoom: u32,
         tile: &Tile,
-    ) -> Result<usize, VulkanError> {
+    ) -> Result<VertexBuildResult, VulkanError> {
         let vertex_buffer_allocation = self.vertex_buffer_allocation.as_ref().unwrap();
         let data_ptr = vertex_buffer_allocation.mapped_ptr().unwrap().as_ptr() as *mut f32;
 
@@ -326,6 +371,52 @@ impl VulkanRenderer {
         }
     }
 
+    fn grow_vertex_buffer(&mut self, needed_floats: usize) -> Result<(), VulkanError> {
+        let required = needed_floats.max(self.vertex_buffer_capacity + 1);
+        let grown = self
+            .vertex_buffer_capacity
+            .saturating_mul(2)
+            .max(required)
+            .next_power_of_two();
+
+        log::warn!(
+            "Growing vertex buffer from {} to {} floats for dense tile",
+            self.vertex_buffer_capacity,
+            grown
+        );
+
+        unsafe {
+            self.context.device.device_wait_idle()?;
+        }
+
+        if let Some(old_buffer) = self.vertex_buffer.take() {
+            unsafe {
+                self.context.device.destroy_buffer(old_buffer, None);
+            }
+        }
+        if let Some(old_allocation) = self.vertex_buffer_allocation.take() {
+            let mut allocator = self.memory_manager.lock().unwrap();
+            allocator.free(old_allocation)?;
+        }
+
+        let (vertex_buffer, vertex_buffer_allocation) = {
+            let mut allocator = self.memory_manager.lock().unwrap();
+            create_buffer(
+                &self.context.device,
+                &mut allocator,
+                (grown * std::mem::size_of::<f32>()) as vk::DeviceSize,
+                vk::BufferUsageFlags::VERTEX_BUFFER,
+                MemoryLocation::CpuToGpu,
+                "vertex_buffer",
+            )?
+        };
+
+        self.vertex_buffer = Some(vertex_buffer);
+        self.vertex_buffer_allocation = Some(vertex_buffer_allocation);
+        self.vertex_buffer_capacity = grown;
+        Ok(())
+    }
+
     /// Build vertex buffer for non-styled shaders (LINE_LIST, 2 floats per vertex)
     fn build_simple_vertex_buffer(
         &self,
@@ -334,7 +425,7 @@ impl VulkanRenderer {
         mmap_data: &MappedData,
         bbox: &BoundingBox,
         tile: &Tile,
-    ) -> Result<usize, VulkanError> {
+    ) -> Result<VertexBuildResult, VulkanError> {
         let mut vertex_count = 0;
 
         log::info!("Building simple vertex buffer for tile {:?}: {} objects, capacity={} floats",
@@ -355,8 +446,16 @@ impl VulkanRenderer {
 
                 for i in 1..points.len() {
                     if index + 4 > self.vertex_buffer_capacity {
-                        log::error!("Vertex buffer overflow for tile {:?}!", tile);
-                        break;
+                        let needed = index + 4;
+                        log::warn!(
+                            "Vertex buffer overflow for tile {:?}: needed {} floats, capacity {}",
+                            tile,
+                            needed,
+                            self.vertex_buffer_capacity
+                        );
+                        return Ok(VertexBuildResult::Overflow {
+                            needed_floats: needed,
+                        });
                     }
 
                     vertices[index] = points[i - 1].lon as f32;
@@ -369,7 +468,7 @@ impl VulkanRenderer {
             }
         }
 
-        Ok(vertex_count)
+        Ok(VertexBuildResult::Complete(vertex_count))
     }
 
     /// Build vertex buffer for styled shader (TRIANGLE_LIST, quad expansion + polygon fill, z-ordering)
@@ -381,7 +480,7 @@ impl VulkanRenderer {
         bbox: &BoundingBox,
         zoom: u32,
         tile: &Tile,
-    ) -> Result<usize, VulkanError> {
+    ) -> Result<VertexBuildResult, VulkanError> {
         let stylesheet = self.stylesheet.as_ref().unwrap();
         let tile_px = self.tile_size as f64;
 
@@ -389,7 +488,7 @@ impl VulkanRenderer {
         let lon_range = (bbox.max.lon - bbox.min.lon) as f64;
         let lat_range = (bbox.max.lat - bbox.min.lat) as f64;
         if lon_range == 0.0 || lat_range == 0.0 {
-            return Ok(0);
+            return Ok(VertexBuildResult::Complete(0));
         }
         let sx = tile_px / lon_range; // pixels per degree longitude
         let sy = tile_px / lat_range; // pixels per degree latitude
@@ -404,6 +503,8 @@ impl VulkanRenderer {
             color: [f32; 4],     // stroke color (for lines)
             fill_color: Option<[f32; 4]>, // fill color (for areas)
             width: f32,
+            casing_color: Option<[f32; 4]>,
+            casing_width: f32,
             is_area: bool,
         }
 
@@ -435,6 +536,8 @@ impl VulkanRenderer {
                 let color = evaluated.color.map(|c| c.to_array()).unwrap_or([0.0, 0.0, 0.0, 1.0]);
                 let fill_color = evaluated.fill_color.map(|c| c.to_array());
                 let width = evaluated.width.unwrap_or(1.0);
+                let casing_color = evaluated.casing_color.map(|c| c.to_array());
+                let casing_width = evaluated.casing_width.unwrap_or(0.0).max(0.0);
                 let z_index = evaluated.z_index.unwrap_or(0);
 
                 styled_objects.push(StyledObject {
@@ -443,6 +546,8 @@ impl VulkanRenderer {
                     color,
                     fill_color,
                     width,
+                    casing_color,
+                    casing_width,
                     is_area,
                 });
             }
@@ -493,8 +598,16 @@ impl VulkanRenderer {
                     // Each triangle = 3 indices = 3 vertices = 18 floats
                     let floats_needed = triangles.len() * 6;
                     if index + floats_needed > self.vertex_buffer_capacity {
-                        log::error!("Vertex buffer overflow for tile {:?} at {} floats (area)!", tile, index);
-                        return Ok(vertex_count);
+                        let needed = index + floats_needed;
+                        log::warn!(
+                            "Vertex buffer overflow for tile {:?}: needed {} floats, capacity {}",
+                            tile,
+                            needed,
+                            self.vertex_buffer_capacity
+                        );
+                        return Ok(VertexBuildResult::Overflow {
+                            needed_floats: needed,
+                        });
                     }
 
                     for tri_idx in (0..triangles.len()).step_by(3) {
@@ -517,10 +630,21 @@ impl VulkanRenderer {
                 let half_width_px = obj.width as f64 / 2.0;
 
                 for i in 1..points.len() {
-                    // Each line segment becomes 2 triangles = 6 vertices = 36 floats
-                    if index + 36 > self.vertex_buffer_capacity {
-                        log::error!("Vertex buffer overflow for tile {:?} at {} floats!", tile, index);
-                        return Ok(vertex_count);
+                    // Base line segment: 2 triangles = 6 vertices = 36 floats
+                    // With casing we emit an additional quad (another 36 floats)
+                    let with_casing = obj.casing_color.is_some() && obj.casing_width > 0.0;
+                    let floats_needed = if with_casing { 72 } else { 36 };
+                    if index + floats_needed > self.vertex_buffer_capacity {
+                        let needed = index + floats_needed;
+                        log::warn!(
+                            "Vertex buffer overflow for tile {:?}: needed {} floats, capacity {}",
+                            tile,
+                            needed,
+                            self.vertex_buffer_capacity
+                        );
+                        return Ok(VertexBuildResult::Overflow {
+                            needed_floats: needed,
+                        });
                     }
 
                     let x0 = points[i - 1].lon;
@@ -547,28 +671,38 @@ impl VulkanRenderer {
                     let x1f = x1 as f32;
                     let y1f = y1 as f32;
 
-                    // 4 corners of the quad:
-                    // A = start + offset, B = start - offset
-                    // C = end + offset,   D = end - offset
-                    let ax = x0f + offset_lon;
-                    let ay = y0f + offset_lat;
-                    let bx = x0f - offset_lon;
-                    let by = y0f - offset_lat;
-                    let cx = x1f + offset_lon;
-                    let cy = y1f + offset_lat;
-                    let dx_v = x1f - offset_lon;
-                    let dy_v = y1f - offset_lat;
+                    // If casing is configured, draw outer quad first
+                    if with_casing {
+                        let case_half_width_px = (obj.width + 2.0 * obj.casing_width) as f64 / 2.0;
+                        let case_offset_lon = (perp_sx * case_half_width_px / sx) as f32;
+                        let case_offset_lat = (perp_sy * case_half_width_px / sy) as f32;
+                        let case_color = obj.casing_color.as_ref().unwrap();
+                        write_line_quad(
+                            vertices,
+                            index,
+                            x0f,
+                            y0f,
+                            x1f,
+                            y1f,
+                            case_offset_lon,
+                            case_offset_lat,
+                            case_color,
+                        );
+                        index += 36;
+                        vertex_count += 6;
+                    }
 
-                    // Triangle 1: A, B, C
-                    write_vertex(vertices, index, ax, ay, &obj.color);
-                    write_vertex(vertices, index + 6, bx, by, &obj.color);
-                    write_vertex(vertices, index + 12, cx, cy, &obj.color);
-
-                    // Triangle 2: B, D, C
-                    write_vertex(vertices, index + 18, bx, by, &obj.color);
-                    write_vertex(vertices, index + 24, dx_v, dy_v, &obj.color);
-                    write_vertex(vertices, index + 30, cx, cy, &obj.color);
-
+                    write_line_quad(
+                        vertices,
+                        index,
+                        x0f,
+                        y0f,
+                        x1f,
+                        y1f,
+                        offset_lon,
+                        offset_lat,
+                        &obj.color,
+                    );
                     index += 36;
                     vertex_count += 6;
                 }
@@ -578,7 +712,7 @@ impl VulkanRenderer {
         log::info!("  Pass 2: {} vertices ({} triangles) written",
                    vertex_count, vertex_count / 3);
 
-        Ok(vertex_count)
+        Ok(VertexBuildResult::Complete(vertex_count))
     }
 
     fn create_uniform_buffer(&self, bbox: &BoundingBox) -> Result<(vk::Buffer, Allocation), VulkanError> {
@@ -771,11 +905,20 @@ impl Drop for VulkanRenderer {
 
             if let Some(render_target) = self.render_target.take() {
                 self.context.device.destroy_framebuffer(render_target.framebuffer, None);
+                self.context
+                    .device
+                    .destroy_image_view(render_target.msaa_color_image_view, None);
+                self.context
+                    .device
+                    .destroy_image(render_target.msaa_color_image, None);
                 self.context.device.destroy_image_view(render_target.color_image_view, None);
                 self.context.device.destroy_image(render_target.color_image, None);
                 self.context.device.destroy_buffer(render_target.staging_buffer, None);
 
                 let mut allocator = self.memory_manager.lock().unwrap();
+                allocator
+                    .free(render_target.msaa_color_image_allocation)
+                    .ok();
                 allocator.free(render_target.color_image_allocation).ok();
                 allocator.free(render_target.staging_buffer_allocation).ok();
             }
@@ -807,6 +950,38 @@ fn write_vertex(vertices: &mut [f32], offset: usize, lon: f32, lat: f32, color: 
     vertices[offset + 3] = color[1];
     vertices[offset + 4] = color[2];
     vertices[offset + 5] = color[3];
+}
+
+#[inline(always)]
+fn write_line_quad(
+    vertices: &mut [f32],
+    offset: usize,
+    x0: f32,
+    y0: f32,
+    x1: f32,
+    y1: f32,
+    offset_lon: f32,
+    offset_lat: f32,
+    color: &[f32; 4],
+) {
+    let ax = x0 + offset_lon;
+    let ay = y0 + offset_lat;
+    let bx = x0 - offset_lon;
+    let by = y0 - offset_lat;
+    let cx = x1 + offset_lon;
+    let cy = y1 + offset_lat;
+    let dx = x1 - offset_lon;
+    let dy = y1 - offset_lat;
+
+    // Triangle 1: A, B, C
+    write_vertex(vertices, offset, ax, ay, color);
+    write_vertex(vertices, offset + 6, bx, by, color);
+    write_vertex(vertices, offset + 12, cx, cy, color);
+
+    // Triangle 2: B, D, C
+    write_vertex(vertices, offset + 18, bx, by, color);
+    write_vertex(vertices, offset + 24, dx, dy, color);
+    write_vertex(vertices, offset + 30, cx, cy, color);
 }
 
 fn create_orthographic_projection(tile_size: u32) -> [[f32; 4]; 4] {

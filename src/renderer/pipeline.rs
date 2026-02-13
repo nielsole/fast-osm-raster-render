@@ -19,6 +19,7 @@ pub fn create_graphics_pipeline(
     render_pass: vk::RenderPass,
     descriptor_set_layout: vk::DescriptorSetLayout,
     shader_type: ShaderType,
+    sample_count: vk::SampleCountFlags,
     tile_size: u32,
 ) -> Result<(vk::Pipeline, vk::PipelineLayout), vk::Result> {
     // Load shader modules
@@ -136,7 +137,7 @@ pub fn create_graphics_pipeline(
     // Multisampling (disabled)
     let multisampling = vk::PipelineMultisampleStateCreateInfo::default()
         .sample_shading_enable(false)
-        .rasterization_samples(vk::SampleCountFlags::TYPE_1);
+        .rasterization_samples(sample_count);
 
     // Color blending
     let color_blend_attachment = vk::PipelineColorBlendAttachmentState::default()
@@ -195,11 +196,22 @@ pub fn create_graphics_pipeline(
 pub fn create_render_pass(
     device: &ash::Device,
     format: vk::Format,
+    sample_count: vk::SampleCountFlags,
 ) -> Result<vk::RenderPass, vk::Result> {
-    let color_attachment = vk::AttachmentDescription::default()
+    let msaa_color_attachment = vk::AttachmentDescription::default()
+        .format(format)
+        .samples(sample_count)
+        .load_op(vk::AttachmentLoadOp::CLEAR)
+        .store_op(vk::AttachmentStoreOp::DONT_CARE)
+        .stencil_load_op(vk::AttachmentLoadOp::DONT_CARE)
+        .stencil_store_op(vk::AttachmentStoreOp::DONT_CARE)
+        .initial_layout(vk::ImageLayout::UNDEFINED)
+        .final_layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL);
+
+    let resolve_attachment = vk::AttachmentDescription::default()
         .format(format)
         .samples(vk::SampleCountFlags::TYPE_1)
-        .load_op(vk::AttachmentLoadOp::CLEAR)
+        .load_op(vk::AttachmentLoadOp::DONT_CARE)
         .store_op(vk::AttachmentStoreOp::STORE)
         .stencil_load_op(vk::AttachmentLoadOp::DONT_CARE)
         .stencil_store_op(vk::AttachmentStoreOp::DONT_CARE)
@@ -210,11 +222,17 @@ pub fn create_render_pass(
         .attachment(0)
         .layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL);
 
+    let resolve_attachment_ref = vk::AttachmentReference::default()
+        .attachment(1)
+        .layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL);
+
     let color_attachments = [color_attachment_ref];
+    let resolve_attachments = [resolve_attachment_ref];
 
     let subpass = vk::SubpassDescription::default()
         .pipeline_bind_point(vk::PipelineBindPoint::GRAPHICS)
-        .color_attachments(&color_attachments);
+        .color_attachments(&color_attachments)
+        .resolve_attachments(&resolve_attachments);
 
     let dependency = vk::SubpassDependency::default()
         .src_subpass(vk::SUBPASS_EXTERNAL)
@@ -224,7 +242,7 @@ pub fn create_render_pass(
         .dst_stage_mask(vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT)
         .dst_access_mask(vk::AccessFlags::COLOR_ATTACHMENT_WRITE);
 
-    let attachments = [color_attachment];
+    let attachments = [msaa_color_attachment, resolve_attachment];
     let subpasses = [subpass];
     let dependencies = [dependency];
 

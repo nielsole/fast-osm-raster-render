@@ -248,6 +248,24 @@ fn width_declaration(input: &str) -> IResult<&str, Declaration> {
     Ok((rest, Declaration::Width(value)))
 }
 
+/// Parse casing-color declaration: casing-color: #555555;
+fn casing_color_declaration(input: &str) -> IResult<&str, Declaration> {
+    let (rest, _) = ws(tag("casing-color"))(input)?;
+    let (rest, _) = ws(char(':'))(rest)?;
+    let (rest, color) = ws(hex_color)(rest)?;
+    let (rest, _) = ws(char(';'))(rest)?;
+    Ok((rest, Declaration::CasingColor(color)))
+}
+
+/// Parse casing-width declaration: casing-width: 1.0;
+fn casing_width_declaration(input: &str) -> IResult<&str, Declaration> {
+    let (rest, _) = ws(tag("casing-width"))(input)?;
+    let (rest, _) = ws(char(':'))(rest)?;
+    let (rest, value) = ws(float_value)(rest)?;
+    let (rest, _) = ws(char(';'))(rest)?;
+    Ok((rest, Declaration::CasingWidth(value)))
+}
+
 /// Parse z-index declaration: z-index: 5;
 fn z_index_declaration(input: &str) -> IResult<&str, Declaration> {
     let (rest, _) = ws(tag("z-index"))(input)?;
@@ -270,6 +288,8 @@ fn opacity_declaration(input: &str) -> IResult<&str, Declaration> {
 fn declaration(input: &str) -> IResult<&str, Declaration> {
     alt((
         fill_color_declaration,
+        casing_color_declaration,
+        casing_width_declaration,
         color_declaration,
         width_declaration,
         z_index_declaration,
@@ -525,6 +545,21 @@ mod tests {
                 assert!((c.b - 223.0 / 255.0).abs() < 0.01);
             }
             _ => panic!("Expected FillColor declaration"),
+        }
+    }
+
+    #[test]
+    fn test_parse_casing_declarations() {
+        let (_, decl) = declaration("casing-color: #555555;").unwrap();
+        match decl {
+            Declaration::CasingColor(_) => {}
+            other => panic!("Expected CasingColor, got {:?}", other),
+        }
+
+        let (_, decl) = declaration("casing-width: 1.25;").unwrap();
+        match decl {
+            Declaration::CasingWidth(v) => assert_eq!(v, 1.25),
+            other => panic!("Expected CasingWidth, got {:?}", other),
         }
     }
 

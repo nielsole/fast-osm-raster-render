@@ -75,6 +75,7 @@ pub fn create_image(
     width: u32,
     height: u32,
     format: vk::Format,
+    samples: vk::SampleCountFlags,
     usage: vk::ImageUsageFlags,
     location: MemoryLocation,
     name: &str,
@@ -93,7 +94,7 @@ pub fn create_image(
         .initial_layout(vk::ImageLayout::UNDEFINED)
         .usage(usage)
         .sharing_mode(vk::SharingMode::EXCLUSIVE)
-        .samples(vk::SampleCountFlags::TYPE_1);
+        .samples(samples);
 
     let image = unsafe { device.create_image(&image_info, None) }
         .map_err(|e| gpu_allocator::AllocationError::Internal(e.to_string()))?;
