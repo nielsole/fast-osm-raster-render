@@ -15,11 +15,8 @@ impl Tile {
     /// Calculate tile index in quadtree
     /// This MUST match the Go version exactly
     pub fn index(&self) -> u64 {
-        // Calculate the total number of tiles for all zoom levels from 0 to z-1
-        let mut total = 0u64;
-        for z in 0..self.z {
-            total += 4u64.pow(z);
-        }
+        // Closed-form geometric series: sum of 4^z for z in 0..self.z = (4^self.z - 1) / 3
+        let total = if self.z == 0 { 0 } else { (4u64.pow(self.z) - 1) / 3 };
 
         // Calculate the position of the tile within its zoom level
         let level_pos = self.y * 2u32.pow(self.z) + self.x;
@@ -154,29 +151,24 @@ pub type MapObjectOffset = u64;
 pub struct MapObject {
     pub bounding_box: BoundingBox,
     pub points: Vec<Point>,
-    /// Phase 0: Store highway tag only (Phase 1 will expand to full HashMap)
-    pub highway_tag: Option<String>,
+    /// Whether this object is a closed polygon (building, park, water, etc.)
+    pub is_area: bool,
+    /// All OSM tags for this way
+    pub tags: Vec<(String, String)>,
 }
 
 impl MapObject {
-    pub fn new(bounding_box: BoundingBox, points: Vec<Point>) -> Self {
-        MapObject {
-            bounding_box,
-            points,
-            highway_tag: None,
-        }
-    }
-
-    /// Create a map object with a highway tag (Phase 0)
-    pub fn with_highway_tag(
+    pub fn new(
         bounding_box: BoundingBox,
         points: Vec<Point>,
-        highway_tag: Option<String>,
+        is_area: bool,
+        tags: Vec<(String, String)>,
     ) -> Self {
         MapObject {
             bounding_box,
             points,
-            highway_tag,
+            is_area,
+            tags,
         }
     }
 }

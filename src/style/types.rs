@@ -73,10 +73,10 @@ pub struct ZoomRange {
 #[derive(Debug, Clone, PartialEq)]
 pub enum Declaration {
     Color(Color),
-    Width(f32),     // Phase 1
-    Opacity(f32),   // Phase 1
-    ZIndex(i32),    // Phase 1
-    // More in later phases...
+    FillColor(Color),
+    Width(f32),
+    Opacity(f32),
+    ZIndex(i32),
 }
 
 impl Selector {

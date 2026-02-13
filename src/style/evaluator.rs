@@ -12,6 +12,7 @@ use std::collections::HashMap;
 #[derive(Debug, Clone)]
 pub struct EvaluatedStyle {
     pub color: Option<super::Color>,
+    pub fill_color: Option<super::Color>,
     pub width: Option<f32>,
     pub opacity: Option<f32>,
     pub z_index: Option<i32>,
@@ -21,6 +22,7 @@ impl Default for EvaluatedStyle {
     fn default() -> Self {
         EvaluatedStyle {
             color: Some(super::Color::BLACK), // Default black
+            fill_color: None,                 // No fill by default
             width: Some(1.0),                 // Default 1px
             opacity: Some(1.0),               // Default opaque
             z_index: Some(0),                 // Default layer
@@ -35,13 +37,13 @@ pub fn evaluate_style(
     stylesheet: &StyleSheet,
     object_type: ObjectType,
     tags: &HashMap<String, String>,
-    _zoom: u32, // Phase 1: zoom filtering
+    zoom: u32,
 ) -> Option<EvaluatedStyle> {
     let mut style = EvaluatedStyle::default();
     let mut matched = false;
 
     for rule in &stylesheet.rules {
-        if matches_selector(&rule.selector, object_type, tags) {
+        if matches_selector(&rule.selector, object_type, tags, zoom) {
             matched = true;
             apply_declarations(&mut style, &rule.declarations);
         }
@@ -54,15 +56,120 @@ pub fn evaluate_style(
     }
 }
 
+/// Evaluate a stylesheet against an object using a tag lookup function.
+/// This avoids building a HashMap when tags are read from mmap.
+///
+/// `tag_lookup` takes a key and returns Some(value) if the tag exists.
+/// `has_tag` takes a key and returns true if the tag exists (for Exists checks).
+pub fn evaluate_style_with_lookup<F, G>(
+    stylesheet: &StyleSheet,
+    object_type: ObjectType,
+    tag_lookup: F,
+    has_tag: G,
+    zoom: u32,
+) -> Option<EvaluatedStyle>
+where
+    F: Fn(&str) -> Option<String>,
+    G: Fn(&str) -> bool,
+{
+    let mut style = EvaluatedStyle::default();
+    let mut matched = false;
+
+    for rule in &stylesheet.rules {
+        if matches_selector_with_lookup(&rule.selector, object_type, &tag_lookup, &has_tag, zoom) {
+            matched = true;
+            apply_declarations(&mut style, &rule.declarations);
+        }
+    }
+
+    if matched {
+        Some(style)
+    } else {
+        None
+    }
+}
+
+/// Check if a selector matches using lookup functions (no HashMap)
+fn matches_selector_with_lookup<F, G>(
+    selector: &Selector,
+    object_type: ObjectType,
+    tag_lookup: &F,
+    has_tag: &G,
+    zoom: u32,
+) -> bool
+where
+    F: Fn(&str) -> Option<String>,
+    G: Fn(&str) -> bool,
+{
+    if !matches_object_type(selector.object_type, object_type) {
+        return false;
+    }
+
+    if let Some(ref zoom_range) = selector.zoom_range {
+        if let Some(min) = zoom_range.min {
+            if zoom < min {
+                return false;
+            }
+        }
+        if let Some(max) = zoom_range.max {
+            if zoom > max {
+                return false;
+            }
+        }
+    }
+
+    for condition in &selector.conditions {
+        if !matches_tag_test_with_lookup(condition, tag_lookup, has_tag) {
+            return false;
+        }
+    }
+
+    true
+}
+
+/// Check if a tag test matches using lookup functions
+fn matches_tag_test_with_lookup<F, G>(test: &TagTest, tag_lookup: &F, has_tag: &G) -> bool
+where
+    F: Fn(&str) -> Option<String>,
+    G: Fn(&str) -> bool,
+{
+    match test.operator {
+        CompareOp::Equal => {
+            tag_lookup(&test.key).map(|v| v == test.value).unwrap_or(false)
+        }
+        CompareOp::NotEqual => {
+            tag_lookup(&test.key).map(|v| v != test.value).unwrap_or(true)
+        }
+        CompareOp::Exists => has_tag(&test.key),
+        CompareOp::NotExists => !has_tag(&test.key),
+        _ => false,
+    }
+}
+
 /// Check if a selector matches an object
 fn matches_selector(
     selector: &Selector,
     object_type: ObjectType,
     tags: &HashMap<String, String>,
+    zoom: u32,
 ) -> bool {
     // Check object type
     if !matches_object_type(selector.object_type, object_type) {
         return false;
+    }
+
+    // Check zoom range
+    if let Some(ref zoom_range) = selector.zoom_range {
+        if let Some(min) = zoom_range.min {
+            if zoom < min {
+                return false;
+            }
+        }
+        if let Some(max) = zoom_range.max {
+            if zoom > max {
+                return false;
+            }
+        }
     }
 
     // Check all tag conditions
@@ -71,13 +178,6 @@ fn matches_selector(
             return false;
         }
     }
-
-    // Phase 1: Check zoom range
-    // if let Some(zoom_range) = &selector.zoom_range {
-    //     if !matches_zoom_range(zoom_range, zoom) {
-    //         return false;
-    //     }
-    // }
 
     true
 }
@@ -111,6 +211,7 @@ fn apply_declarations(style: &mut EvaluatedStyle, declarations: &[Declaration]) 
     for decl in declarations {
         match decl {
             Declaration::Color(color) => style.color = Some(*color),
+            Declaration::FillColor(color) => style.fill_color = Some(*color),
             Declaration::Width(width) => style.width = Some(*width),
             Declaration::Opacity(opacity) => style.opacity = Some(*opacity),
             Declaration::ZIndex(z) => style.z_index = Some(*z),
@@ -187,13 +288,67 @@ mod tests {
         };
 
         let tags = make_tags(&[("highway", "primary")]);
-        assert!(matches_selector(&selector, ObjectType::Way, &tags));
+        assert!(matches_selector(&selector, ObjectType::Way, &tags, 10));
 
         let tags = make_tags(&[("highway", "secondary")]);
-        assert!(!matches_selector(&selector, ObjectType::Way, &tags));
+        assert!(!matches_selector(&selector, ObjectType::Way, &tags, 10));
 
         // Wrong object type
-        assert!(!matches_selector(&selector, ObjectType::Node, &tags));
+        assert!(!matches_selector(&selector, ObjectType::Node, &tags, 10));
+    }
+
+    #[test]
+    fn test_zoom_in_range() {
+        let selector = Selector {
+            object_type: ObjectType::Way,
+            conditions: vec![],
+            zoom_range: Some(super::super::types::ZoomRange { min: Some(8), max: Some(15) }),
+        };
+
+        let tags = make_tags(&[("highway", "primary")]);
+        assert!(matches_selector(&selector, ObjectType::Way, &tags, 10));
+        assert!(matches_selector(&selector, ObjectType::Way, &tags, 8));
+        assert!(matches_selector(&selector, ObjectType::Way, &tags, 15));
+    }
+
+    #[test]
+    fn test_zoom_below_range() {
+        let selector = Selector {
+            object_type: ObjectType::Way,
+            conditions: vec![],
+            zoom_range: Some(super::super::types::ZoomRange { min: Some(10), max: Some(15) }),
+        };
+
+        let tags = make_tags(&[("highway", "primary")]);
+        assert!(!matches_selector(&selector, ObjectType::Way, &tags, 5));
+        assert!(!matches_selector(&selector, ObjectType::Way, &tags, 9));
+    }
+
+    #[test]
+    fn test_zoom_above_range() {
+        let selector = Selector {
+            object_type: ObjectType::Way,
+            conditions: vec![],
+            zoom_range: Some(super::super::types::ZoomRange { min: Some(10), max: Some(15) }),
+        };
+
+        let tags = make_tags(&[("highway", "primary")]);
+        assert!(!matches_selector(&selector, ObjectType::Way, &tags, 16));
+        assert!(!matches_selector(&selector, ObjectType::Way, &tags, 20));
+    }
+
+    #[test]
+    fn test_zoom_min_only() {
+        let selector = Selector {
+            object_type: ObjectType::Way,
+            conditions: vec![],
+            zoom_range: Some(super::super::types::ZoomRange { min: Some(12), max: None }),
+        };
+
+        let tags = make_tags(&[("highway", "residential")]);
+        assert!(!matches_selector(&selector, ObjectType::Way, &tags, 11));
+        assert!(matches_selector(&selector, ObjectType::Way, &tags, 12));
+        assert!(matches_selector(&selector, ObjectType::Way, &tags, 18));
     }
 
     #[test]

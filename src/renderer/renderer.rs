@@ -2,17 +2,17 @@ use super::command::*;
 use super::memory::*;
 use super::pipeline::*;
 use super::vulkan::{VulkanContext, VulkanError};
-use crate::data::mmap::{MappedData, MapObjectView};
+use crate::data::mmap::MappedData;
 use crate::data::spatial::TileIndex;
 use crate::data::types::{BoundingBox, Tile};
 use crate::projection::get_bounding_box;
-use crate::style::{parse_mapcss, evaluate_style, StyleSheet}; // Phase 0: MapCSS support
+use crate::style::{parse_mapcss, StyleSheet};
+use crate::style::evaluator::evaluate_style_with_lookup;
 use crate::style::types::ObjectType;
 use ash::vk;
 use gpu_allocator::vulkan::{Allocation, Allocator};
 use gpu_allocator::MemoryLocation;
 use image::RgbaImage;
-use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
 /// Uniform buffer object matching the shader layout
@@ -49,9 +49,8 @@ pub struct VulkanRenderer {
     pipeline: vk::Pipeline,
     descriptor_pool: vk::DescriptorPool,
 
-    // Phase 0: Optional stylesheet for MapCSS styling
+    // Optional stylesheet for MapCSS styling
     stylesheet: Option<StyleSheet>,
-    data_file_path: Option<String>, // Phase 0: Path to data file for reading tags
 
     // Memory manager must be dropped before context
     memory_manager: Arc<Mutex<Allocator>>,
@@ -124,7 +123,7 @@ impl VulkanRenderer {
         // To maintain same vertex capacity, styled shader needs 3x the float capacity
         let base_capacity = 10_000_000; // 10M floats for regular shader = 40MB
         let vertex_buffer_capacity = match shader_type {
-            ShaderType::Styled => base_capacity * 3, // 30M floats = 120MB
+            ShaderType::Styled => 50_000_000, // 50M floats = 200MB (quad expansion: 6 verts * 6 floats per segment)
             _ => base_capacity,
         };
         let (vertex_buffer, vertex_buffer_allocation) = {
@@ -154,8 +153,7 @@ impl VulkanRenderer {
             vertex_buffer: Some(vertex_buffer),
             vertex_buffer_allocation: Some(vertex_buffer_allocation),
             vertex_buffer_capacity,
-            stylesheet: None, // Phase 0: Initialize without stylesheet
-            data_file_path: None, // Phase 0: Will be set via set_data_file_path()
+            stylesheet: None,
         })
     }
 
@@ -168,11 +166,6 @@ impl VulkanRenderer {
             }
             Err(e) => Err(format!("Failed to parse MapCSS: {}", e)),
         }
-    }
-
-    /// Set data file path for tag reading (Phase 0)
-    pub fn set_data_file_path(&mut self, path: String) {
-        self.data_file_path = Some(path);
     }
 
     /// Render a tile and return the image
@@ -321,126 +314,268 @@ impl VulkanRenderer {
     ) -> Result<usize, VulkanError> {
         let vertex_buffer_allocation = self.vertex_buffer_allocation.as_ref().unwrap();
         let data_ptr = vertex_buffer_allocation.mapped_ptr().unwrap().as_ptr() as *mut f32;
+
+        // Check if we have a stylesheet configured (styled path)
+        let use_styled = self.stylesheet.is_some();
+
+        if use_styled {
+            self.build_styled_vertex_buffer(data_ptr, offsets, mmap_data, bbox, zoom, tile)
+        } else {
+            self.build_simple_vertex_buffer(data_ptr, offsets, mmap_data, bbox, tile)
+        }
+    }
+
+    /// Build vertex buffer for non-styled shaders (LINE_LIST, 2 floats per vertex)
+    fn build_simple_vertex_buffer(
+        &self,
+        data_ptr: *mut f32,
+        offsets: &[u64],
+        mmap_data: &MappedData,
+        bbox: &BoundingBox,
+        tile: &Tile,
+    ) -> Result<usize, VulkanError> {
         let mut vertex_count = 0;
 
-        // Determine vertex size based on shader type
-        let (vertex_size, use_colors) = if self.pipeline == self.pipeline {  // Always true, but need shader_type
-            // Check if we have a stylesheet configured
-            match self.stylesheet {
-                Some(_) => (6, true),  // Styled: (lon, lat, r, g, b, a)
-                None => (2, false),     // Regular: (lon, lat)
-            }
-        } else {
-            (2, false)
-        };
-
-        log::info!("Building vertex buffer for tile {:?}: {} objects, vertex_size={}, capacity={} floats",
-                   tile, offsets.len(), vertex_size, self.vertex_buffer_capacity);
+        log::info!("Building simple vertex buffer for tile {:?}: {} objects, capacity={} floats",
+                   tile, offsets.len(), self.vertex_buffer_capacity);
 
         unsafe {
             let vertices = std::slice::from_raw_parts_mut(data_ptr, self.vertex_buffer_capacity);
             let mut index = 0;
 
-            for (obj_idx, &offset) in offsets.iter().enumerate() {
+            for &offset in offsets.iter() {
                 let map_object = mmap_data.read_map_object(offset);
                 let obj_bbox = map_object.bounding_box();
                 let points = map_object.points();
 
-                log::debug!("Map object {}: bbox=({}, {}) to ({}, {}), {} points",
-                          obj_idx, obj_bbox.min.lon, obj_bbox.min.lat,
-                          obj_bbox.max.lon, obj_bbox.max.lat, points.len());
-
-                // Check if bounding box overlaps
-                if !bbox.overlaps(obj_bbox) {
-                    log::debug!("  -> Skipped (no overlap)");
+                if !bbox.overlaps(obj_bbox) || points.len() < 2 {
                     continue;
                 }
-
-                // Add line segments (pairs of points)
-                if points.len() < 2 {
-                    log::debug!("  -> Skipped (not enough points: {})", points.len());
-                    continue;
-                }
-
-                // Per-object styling: Read tags and evaluate MapCSS
-                // OPTIMIZATION: Read tags from memory-mapped data instead of opening file
-                let color = if use_colors {
-                    if let Some(ref stylesheet) = &self.stylesheet {
-                        let mut tags = HashMap::new();
-                        if let Some(highway) = map_object.highway_tag() {
-                            tags.insert("highway".to_string(), highway);
-                        }
-
-                        if let Some(evaluated) = evaluate_style(stylesheet, ObjectType::Way, &tags, zoom) {
-                            if let Some(c) = evaluated.color {
-                                c.to_array()
-                            } else {
-                                [0.0, 0.0, 0.0, 1.0] // Default black
-                            }
-                        } else {
-                            [0.0, 0.0, 0.0, 1.0] // Default black
-                        }
-                    } else {
-                        [0.0, 0.0, 0.0, 1.0] // Default black
-                    }
-                } else {
-                    [0.0, 0.0, 0.0, 1.0] // Not used for non-styled shaders
-                };
 
                 for i in 1..points.len() {
-                    let required_space = vertex_size * 2; // Two vertices per line
-                    if index + required_space > self.vertex_buffer_capacity {
-                        log::error!("Vertex buffer overflow for tile {:?}! Object {}/{}, used {} floats, capacity {} floats. Vertex size: {}, vertices so far: {}",
-                                   tile, obj_idx + 1, offsets.len(), index, self.vertex_buffer_capacity, vertex_size, vertex_count);
-                        log::error!("  This tile has too much geometry. Increase vertex_buffer_capacity or implement dynamic allocation.");
+                    if index + 4 > self.vertex_buffer_capacity {
+                        log::error!("Vertex buffer overflow for tile {:?}!", tile);
                         break;
                     }
 
-                    if use_colors {
-                        // Styled shader: (lon, lat, r, g, b, a) per vertex
-                        // Previous point
-                        vertices[index] = points[i - 1].lon as f32;
-                        vertices[index + 1] = points[i - 1].lat as f32;
-                        vertices[index + 2] = color[0];
-                        vertices[index + 3] = color[1];
-                        vertices[index + 4] = color[2];
-                        vertices[index + 5] = color[3];
-
-                        // Current point
-                        vertices[index + 6] = points[i].lon as f32;
-                        vertices[index + 7] = points[i].lat as f32;
-                        vertices[index + 8] = color[0];
-                        vertices[index + 9] = color[1];
-                        vertices[index + 10] = color[2];
-                        vertices[index + 11] = color[3];
-
-                        index += 12;
-                    } else {
-                        // Regular shader: (lon, lat) per vertex
-                        // Previous point
-                        vertices[index] = points[i - 1].lon as f32;
-                        vertices[index + 1] = points[i - 1].lat as f32;
-
-                        // Current point
-                        vertices[index + 2] = points[i].lon as f32;
-                        vertices[index + 3] = points[i].lat as f32;
-
-                        index += 4;
-                    }
-
-                    if vertex_count < 6 && obj_idx == 0 {  // Log first 3 lines of first object
-                        log::info!("    Line {}: ({}, {}) -> ({}, {}) color={:?}",
-                                  vertex_count / 2,
-                                  points[i - 1].lon, points[i - 1].lat,
-                                  points[i].lon, points[i].lat,
-                                  if use_colors { color } else { [0.0, 0.0, 0.0, 0.0] });
-                    }
-
+                    vertices[index] = points[i - 1].lon as f32;
+                    vertices[index + 1] = points[i - 1].lat as f32;
+                    vertices[index + 2] = points[i].lon as f32;
+                    vertices[index + 3] = points[i].lat as f32;
+                    index += 4;
                     vertex_count += 2;
                 }
-                log::debug!("  -> Added {} line segments", points.len() - 1);
             }
         }
+
+        Ok(vertex_count)
+    }
+
+    /// Build vertex buffer for styled shader (TRIANGLE_LIST, quad expansion + polygon fill, z-ordering)
+    fn build_styled_vertex_buffer(
+        &self,
+        data_ptr: *mut f32,
+        offsets: &[u64],
+        mmap_data: &MappedData,
+        bbox: &BoundingBox,
+        zoom: u32,
+        tile: &Tile,
+    ) -> Result<usize, VulkanError> {
+        let stylesheet = self.stylesheet.as_ref().unwrap();
+        let tile_px = self.tile_size as f64;
+
+        // Tile coordinate ranges
+        let lon_range = (bbox.max.lon - bbox.min.lon) as f64;
+        let lat_range = (bbox.max.lat - bbox.min.lat) as f64;
+        if lon_range == 0.0 || lat_range == 0.0 {
+            return Ok(0);
+        }
+        let sx = tile_px / lon_range; // pixels per degree longitude
+        let sy = tile_px / lat_range; // pixels per degree latitude
+
+        log::info!("Building styled vertex buffer for tile {:?}: {} objects, zoom={}, capacity={} floats",
+                   tile, offsets.len(), zoom, self.vertex_buffer_capacity);
+
+        // Pass 1: Evaluate style for all visible objects
+        struct StyledObject {
+            offset: u64,
+            z_index: i32,
+            color: [f32; 4],     // stroke color (for lines)
+            fill_color: Option<[f32; 4]>, // fill color (for areas)
+            width: f32,
+            is_area: bool,
+        }
+
+        let mut styled_objects = Vec::with_capacity(offsets.len() / 4); // Most objects will be filtered
+
+        for &offset in offsets.iter() {
+            let map_object = mmap_data.read_map_object(offset);
+            let obj_bbox = map_object.bounding_box();
+
+            if !bbox.overlaps(obj_bbox) {
+                continue;
+            }
+
+            if map_object.points().len() < 2 {
+                continue;
+            }
+
+            let is_area = map_object.is_area();
+
+            // Evaluate style using zero-alloc tag lookup from mmap
+            let object_type = if is_area { ObjectType::Area } else { ObjectType::Way };
+            if let Some(evaluated) = evaluate_style_with_lookup(
+                stylesheet,
+                object_type,
+                |key| map_object.tag_value(key),
+                |key| map_object.has_tag(key),
+                zoom,
+            ) {
+                let color = evaluated.color.map(|c| c.to_array()).unwrap_or([0.0, 0.0, 0.0, 1.0]);
+                let fill_color = evaluated.fill_color.map(|c| c.to_array());
+                let width = evaluated.width.unwrap_or(1.0);
+                let z_index = evaluated.z_index.unwrap_or(0);
+
+                styled_objects.push(StyledObject {
+                    offset,
+                    z_index,
+                    color,
+                    fill_color,
+                    width,
+                    is_area,
+                });
+            }
+            // Objects matching no rule are not rendered
+        }
+
+        log::info!("  Pass 1: {} objects matched style rules (out of {} total)",
+                   styled_objects.len(), offsets.len());
+
+        // Sort by z_index (lowest first = drawn first = background)
+        styled_objects.sort_by_key(|o| o.z_index);
+
+        // Pass 2: Build vertex buffer
+        let mut vertex_count = 0;
+
+        unsafe {
+            let vertices = std::slice::from_raw_parts_mut(data_ptr, self.vertex_buffer_capacity);
+            let mut index = 0;
+
+            for obj in &styled_objects {
+                let map_object = mmap_data.read_map_object(obj.offset);
+                let points = map_object.points();
+
+                // Area with fill-color: triangulate the polygon
+                if obj.is_area && obj.fill_color.is_some() {
+                    let fill = obj.fill_color.unwrap();
+                    let num_points = points.len();
+
+                    // Need at least 3 unique vertices (closed polygons have first==last)
+                    if num_points < 4 {
+                        continue;
+                    }
+
+                    // Flatten points to f64 array for earcutr (skip closing point)
+                    let unique_count = num_points - 1; // last point == first point
+                    let mut flat_coords: Vec<f64> = Vec::with_capacity(unique_count * 2);
+                    for i in 0..unique_count {
+                        flat_coords.push(points[i].lon);
+                        flat_coords.push(points[i].lat);
+                    }
+
+                    // Triangulate
+                    let triangles = match earcutr::earcut(&flat_coords, &[], 2) {
+                        Ok(t) => t,
+                        Err(_) => continue, // Skip malformed polygons
+                    };
+
+                    // Each triangle = 3 indices = 3 vertices = 18 floats
+                    let floats_needed = triangles.len() * 6;
+                    if index + floats_needed > self.vertex_buffer_capacity {
+                        log::error!("Vertex buffer overflow for tile {:?} at {} floats (area)!", tile, index);
+                        return Ok(vertex_count);
+                    }
+
+                    for tri_idx in (0..triangles.len()).step_by(3) {
+                        let i0 = triangles[tri_idx];
+                        let i1 = triangles[tri_idx + 1];
+                        let i2 = triangles[tri_idx + 2];
+
+                        write_vertex(vertices, index, flat_coords[i0 * 2] as f32, flat_coords[i0 * 2 + 1] as f32, &fill);
+                        write_vertex(vertices, index + 6, flat_coords[i1 * 2] as f32, flat_coords[i1 * 2 + 1] as f32, &fill);
+                        write_vertex(vertices, index + 12, flat_coords[i2 * 2] as f32, flat_coords[i2 * 2 + 1] as f32, &fill);
+
+                        index += 18;
+                        vertex_count += 3;
+                    }
+
+                    continue; // Don't also draw as lines
+                }
+
+                // Line: quad expansion as before
+                let half_width_px = obj.width as f64 / 2.0;
+
+                for i in 1..points.len() {
+                    // Each line segment becomes 2 triangles = 6 vertices = 36 floats
+                    if index + 36 > self.vertex_buffer_capacity {
+                        log::error!("Vertex buffer overflow for tile {:?} at {} floats!", tile, index);
+                        return Ok(vertex_count);
+                    }
+
+                    let x0 = points[i - 1].lon;
+                    let y0 = points[i - 1].lat;
+                    let x1 = points[i].lon;
+                    let y1 = points[i].lat;
+
+                    // Direction in screen space
+                    let dx = (x1 - x0) * sx;
+                    let dy = (y1 - y0) * sy;
+                    let len = (dx * dx + dy * dy).sqrt();
+                    if len < 1e-10 {
+                        continue; // Zero-length segment
+                    }
+
+                    // Perpendicular in screen space, then convert back to lon/lat
+                    let perp_sx = -dy / len;
+                    let perp_sy = dx / len;
+                    let offset_lon = (perp_sx * half_width_px / sx) as f32;
+                    let offset_lat = (perp_sy * half_width_px / sy) as f32;
+
+                    let x0f = x0 as f32;
+                    let y0f = y0 as f32;
+                    let x1f = x1 as f32;
+                    let y1f = y1 as f32;
+
+                    // 4 corners of the quad:
+                    // A = start + offset, B = start - offset
+                    // C = end + offset,   D = end - offset
+                    let ax = x0f + offset_lon;
+                    let ay = y0f + offset_lat;
+                    let bx = x0f - offset_lon;
+                    let by = y0f - offset_lat;
+                    let cx = x1f + offset_lon;
+                    let cy = y1f + offset_lat;
+                    let dx_v = x1f - offset_lon;
+                    let dy_v = y1f - offset_lat;
+
+                    // Triangle 1: A, B, C
+                    write_vertex(vertices, index, ax, ay, &obj.color);
+                    write_vertex(vertices, index + 6, bx, by, &obj.color);
+                    write_vertex(vertices, index + 12, cx, cy, &obj.color);
+
+                    // Triangle 2: B, D, C
+                    write_vertex(vertices, index + 18, bx, by, &obj.color);
+                    write_vertex(vertices, index + 24, dx_v, dy_v, &obj.color);
+                    write_vertex(vertices, index + 30, cx, cy, &obj.color);
+
+                    index += 36;
+                    vertex_count += 6;
+                }
+            }
+        }
+
+        log::info!("  Pass 2: {} vertices ({} triangles) written",
+                   vertex_count, vertex_count / 3);
 
         Ok(vertex_count)
     }
@@ -660,6 +795,17 @@ impl Drop for VulkanRenderer {
             self.context.device.destroy_render_pass(self.render_pass, None);
         }
     }
+}
+
+/// Write a single vertex (lon, lat, r, g, b, a) into the vertex buffer
+#[inline(always)]
+fn write_vertex(vertices: &mut [f32], offset: usize, lon: f32, lat: f32, color: &[f32; 4]) {
+    vertices[offset] = lon;
+    vertices[offset + 1] = lat;
+    vertices[offset + 2] = color[0];
+    vertices[offset + 3] = color[1];
+    vertices[offset + 4] = color[2];
+    vertices[offset + 5] = color[3];
 }
 
 fn create_orthographic_projection(tile_size: u32) -> [[f32; 4]; 4] {

@@ -48,9 +48,7 @@ pub async fn handle_tile_request(
                 let max_points = state.data.max_points;
                 match VulkanRenderer::new_with_tile_size(max_points, state.shader_type, TILE_SIZE_2X) {
                     Ok(mut renderer) => {
-                        // Phase 0: Configure MapCSS if using styled shader
                         if state.shader_type == ShaderType::Styled {
-                            renderer.set_data_file_path(state.data_file_path.clone());
                             if let Some(ref mapcss) = state.stylesheet {
                                 if let Err(e) = renderer.set_stylesheet(mapcss) {
                                     log::error!("Failed to set stylesheet: {}", e);
@@ -84,9 +82,7 @@ pub async fn handle_tile_request(
                 let max_points = state.data.max_points;
                 match VulkanRenderer::new(max_points, state.shader_type) {
                     Ok(mut renderer) => {
-                        // Phase 0: Configure MapCSS if using styled shader
                         if state.shader_type == ShaderType::Styled {
-                            renderer.set_data_file_path(state.data_file_path.clone());
                             if let Some(ref mapcss) = state.stylesheet {
                                 if let Err(e) = renderer.set_stylesheet(mapcss) {
                                     log::error!("Failed to set stylesheet: {}", e);

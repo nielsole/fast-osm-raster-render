@@ -20,30 +20,32 @@ fn test_vulkan_renderer_with_synthetic_data() -> Result<(), Box<dyn std::error::
     let size = 20.0;
 
     // Horizontal line
-    let horizontal_line = MapObject {
-        bounding_box: BoundingBox {
+    let horizontal_line = MapObject::new(
+        BoundingBox {
             min: Point::new(center_lon - size, center_lat - 1.0),
             max: Point::new(center_lon + size, center_lat + 1.0),
         },
-        points: vec![
+        vec![
             Point::new(center_lon - size, center_lat),
             Point::new(center_lon + size, center_lat),
         ],
-        highway_tag: None, // Phase 0: added highway_tag field
-    };
+        false,
+        vec![],
+    );
 
     // Vertical line
-    let vertical_line = MapObject {
-        bounding_box: BoundingBox {
+    let vertical_line = MapObject::new(
+        BoundingBox {
             min: Point::new(center_lon - 1.0, center_lat - size),
             max: Point::new(center_lon + 1.0, center_lat + size),
         },
-        points: vec![
+        vec![
             Point::new(center_lon, center_lat - size),
             Point::new(center_lon, center_lat + size),
         ],
-        highway_tag: None, // Phase 0: added highway_tag field
-    };
+        false,
+        vec![],
+    );
 
     // Write to file
     let offset1 = write_map_object(temp_file.as_file_mut(), &horizontal_line)?;
@@ -98,33 +100,40 @@ fn test_vulkan_renderer_with_synthetic_data() -> Result<(), Box<dyn std::error::
 fn test_vertex_buffer_capacity_calculation() {
     // Test that verifies buffer capacity is sufficient for different shader types
 
-    // Current capacity: 10M floats = 40MB
-    const VERTEX_BUFFER_CAPACITY: usize = 10_000_000;
+    // Regular shader: 10M floats = 40MB
+    const REGULAR_CAPACITY: usize = 10_000_000;
+    // Styled shader: 50M floats = 200MB (quad expansion + polygon fill needs room)
+    const STYLED_CAPACITY: usize = 50_000_000;
 
-    // Regular shader: (lon, lat) = 2 floats per vertex
+    // Regular shader: (lon, lat) = 2 floats per vertex, LINE_LIST topology
     let regular_vertex_size = 2;
-    let regular_max_vertices = VERTEX_BUFFER_CAPACITY / regular_vertex_size;
-    let regular_max_segments = regular_max_vertices / 2; // LINE_LIST topology
+    let regular_max_vertices = REGULAR_CAPACITY / regular_vertex_size;
+    let regular_max_segments = regular_max_vertices / 2; // LINE_LIST: 2 vertices per segment
     println!("Regular shader capacity: {} vertices, {} line segments",
              regular_max_vertices, regular_max_segments);
     assert_eq!(regular_max_vertices, 5_000_000);
     assert_eq!(regular_max_segments, 2_500_000);
 
-    // Styled shader: (lon, lat, r, g, b, a) = 6 floats per vertex
-    let styled_vertex_size = 6;
-    let styled_max_vertices = VERTEX_BUFFER_CAPACITY / styled_vertex_size;
-    let styled_max_segments = styled_max_vertices / 2; // LINE_LIST topology
-    println!("Styled shader capacity: {} vertices, {} line segments",
+    // Styled shader: (lon, lat, r, g, b, a) = 6 floats per vertex, TRIANGLE_LIST topology
+    // Line segments: Each line segment = 2 triangles = 6 vertices = 36 floats
+    let styled_floats_per_segment = 36;
+    let styled_max_segments = STYLED_CAPACITY / styled_floats_per_segment;
+    let styled_max_vertices = styled_max_segments * 6;
+    println!("Styled shader capacity: {} vertices, {} line segments (quad expansion)",
              styled_max_vertices, styled_max_segments);
-    assert_eq!(styled_max_vertices, 1_666_666);
-    assert_eq!(styled_max_segments, 833_333);
+    assert_eq!(styled_max_segments, 1_388_888);
+    assert!(styled_max_segments > 1_000_000, "Should handle >1M line segments");
 
-    // Warning: Styled shader has 3x less capacity!
-    println!("WARNING: Styled shader has {}% capacity of regular shader",
-             (styled_max_segments * 100) / regular_max_segments);
+    // Polygon fill: Each triangle = 3 vertices = 18 floats
+    // A 5-point building = 3 triangles = 9 vertices = 54 floats
+    let polygon_floats_per_triangle = 18;
+    let polygon_max_triangles = STYLED_CAPACITY / polygon_floats_per_triangle;
+    println!("Polygon capacity: {} triangles ({} typical buildings with ~3 triangles each)",
+             polygon_max_triangles, polygon_max_triangles / 3);
+    assert!(polygon_max_triangles > 2_000_000, "Should handle >2M triangles");
 
-    // For tile 11/1082/661@2x (512px) that triggered overflow,
-    // we need to ensure buffer is large enough
-    // Real-world observation: This tile has enough geometry to overflow at 833K segments
-    // Recommendation: Increase capacity for styled shader or implement dynamic allocation
+    // Worst case estimate: 182K objects * ~12 segments = ~2.2M segments
+    // With zoom filtering, most objects are filtered out at any given zoom level
+    println!("Styled shader can handle {} objects with ~12 segments each",
+             styled_max_segments / 12);
 }

@@ -92,9 +92,13 @@ pub fn create_graphics_pipeline(
         .vertex_binding_descriptions(&vertex_binding_descriptions)
         .vertex_attribute_descriptions(&vertex_attribute_descriptions);
 
-    // Input assembly: line list
+    // Input assembly: triangle list for styled (quad expansion), line list for others
+    let topology = match shader_type {
+        ShaderType::Styled => vk::PrimitiveTopology::TRIANGLE_LIST,
+        _ => vk::PrimitiveTopology::LINE_LIST,
+    };
     let input_assembly = vk::PipelineInputAssemblyStateCreateInfo::default()
-        .topology(vk::PrimitiveTopology::LINE_LIST)
+        .topology(topology)
         .primitive_restart_enable(false);
 
     // Viewport and scissor (use provided tile_size)

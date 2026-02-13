@@ -1,6 +1,7 @@
 use super::serialization::{BOUNDING_BOX_SIZE, POINT_SIZE, POINTS_LEN_SIZE};
 use super::types::{BoundingBox, MapObjectOffset, Point};
 use memmap2::Mmap;
+use std::collections::HashMap;
 use std::fs::File;
 use std::io;
 use std::path::Path;
@@ -20,7 +21,7 @@ impl MappedData {
     }
 
     /// Get a zero-copy view of a map object at the given offset
-    pub fn read_map_object(&self, offset: MapObjectOffset) -> MapObjectView {
+    pub fn read_map_object(&self, offset: MapObjectOffset) -> MapObjectView<'_> {
         unsafe { MapObjectView::from_ptr(self.mmap.as_ptr().add(offset as usize)) }
     }
 
@@ -35,48 +36,45 @@ impl MappedData {
     }
 }
 
-/// Zero-copy view into a map object in the memory-mapped file
+/// Zero-copy view into a map object in the memory-mapped file (v2 format)
 ///
 /// # Safety
 /// This structure contains references to memory-mapped data.
 /// The data must not be modified externally while this view exists.
 /// The MappedData must outlive all MapObjectView instances.
 ///
-/// Note: Phase 0 reads BoundingBox by value due to alignment concerns
+/// The v2 format uses 8-byte aligned flags field to preserve Point array alignment.
 #[derive(Debug)]
 pub struct MapObjectView<'a> {
     pub bbox: BoundingBox,
-    pub points: &'a [Point],
-    tags_ptr: *const u8, // Pointer to start of tag data (Phase 0: highway tag)
+    points: &'a [Point],  // Zero-copy reference into mmap
+    is_area: bool,
+    tags_ptr: *const u8, // Pointer to start of tag data (num_tags u16 + key/value pairs)
 }
 
+const FLAGS_SIZE: usize = 8; // u64 flags, padded for alignment
+
 impl<'a> MapObjectView<'a> {
-    /// Create a MapObjectView from a raw pointer
+    /// Create a MapObjectView from a raw pointer (v2 format only)
     ///
     /// # Safety
-    /// The pointer must point to valid map object data in the correct format:
-    /// Phase 0 format:
-    /// - 8 bytes: version (u64)
+    /// The pointer must point to valid map object data in v2 format:
+    /// - 8 bytes: version (u64 = 2)
     /// - 32 bytes: BoundingBox
+    /// - 8 bytes: flags (u64, bit 0 = is_area, padded for alignment)
     /// - 8 bytes: i64 length
-    /// - length * 16 bytes: Point array
-    /// - (tags after points, but we don't read them here for fast rendering)
+    /// - length * 16 bytes: Point array (aligned)
+    /// - 2 bytes: num_tags (u16)
+    /// - for each tag: 2 (key_len) + key + 2 (value_len) + value
     ///
     /// The memory must remain valid and unchanged for the lifetime 'a.
     unsafe fn from_ptr(ptr: *const u8) -> Self {
-        use super::serialization::{FORMAT_VERSION_1, VERSION_SIZE};
+        use super::serialization::VERSION_SIZE;
 
-        // Read version (8 bytes, unaligned)
-        let version = ptr.cast::<u64>().read_unaligned();
+        // Skip version (8 bytes)
+        let data_ptr = ptr.add(VERSION_SIZE);
 
-        // Skip version for new format
-        let data_ptr = if version >= FORMAT_VERSION_1 {
-            ptr.add(VERSION_SIZE) // Skip 8-byte version
-        } else {
-            ptr // Old format, no version
-        };
-
-        // Read bounding box (4 f64s, possibly unaligned)
+        // Read bounding box (4 f64s)
         let min_lon = data_ptr.cast::<f64>().read_unaligned();
         let min_lat = data_ptr.add(8).cast::<f64>().read_unaligned();
         let max_lon = data_ptr.add(16).cast::<f64>().read_unaligned();
@@ -87,23 +85,26 @@ impl<'a> MapObjectView<'a> {
             max: Point::new(max_lon, max_lat),
         };
 
-        // Read points length
-        let points_len = data_ptr
-            .add(BOUNDING_BOX_SIZE)
-            .cast::<i64>()
-            .read_unaligned();
+        // Read flags (8 bytes after bbox, u64 for alignment)
+        let flags_ptr = data_ptr.add(BOUNDING_BOX_SIZE);
+        let flags = flags_ptr.cast::<u64>().read_unaligned();
+        let is_area = (flags & 1) != 0;
 
-        // Read points array (we can assume Point array is okay since we're reading unaligned f64s)
-        let points_start = data_ptr.add(BOUNDING_BOX_SIZE + POINTS_LEN_SIZE);
+        // Read points length (8 bytes after flags)
+        let points_len_ptr = flags_ptr.add(FLAGS_SIZE);
+        let points_len = points_len_ptr.cast::<i64>().read_unaligned() as usize;
+
+        // Zero-copy points array (properly aligned since all preceding fields are 8-byte)
+        let points_start = points_len_ptr.add(POINTS_LEN_SIZE);
         let points = std::slice::from_raw_parts(
             points_start as *const Point,
-            points_len as usize,
+            points_len,
         );
 
         // Tags start after the points array
-        let tags_ptr = points_start.add(points_len as usize * 16); // Each Point is 16 bytes
+        let tags_ptr = points_start.add(points_len * POINT_SIZE);
 
-        MapObjectView { bbox, points, tags_ptr }
+        MapObjectView { bbox, points, is_area, tags_ptr }
     }
 
     /// Get the bounding box
@@ -113,7 +114,7 @@ impl<'a> MapObjectView<'a> {
 
     /// Get the points slice
     pub fn points(&self) -> &[Point] {
-        self.points
+        &self.points
     }
 
     /// Get the number of points
@@ -121,29 +122,93 @@ impl<'a> MapObjectView<'a> {
         self.points.len()
     }
 
-    /// Read the highway tag from memory-mapped data (Phase 0)
-    /// Returns None if tag is not present
-    pub fn highway_tag(&self) -> Option<String> {
+    /// Check if this object is an area (closed polygon)
+    pub fn is_area(&self) -> bool {
+        self.is_area
+    }
+
+    /// Read all tags from memory-mapped data as a HashMap
+    pub fn tags(&self) -> HashMap<String, String> {
         unsafe {
-            // Read tag_present flag (1 byte)
-            let tag_present = self.tags_ptr.read();
+            let num_tags = self.tags_ptr.cast::<u16>().read_unaligned() as usize;
+            let mut map = HashMap::with_capacity(num_tags);
+            let mut cursor = self.tags_ptr.add(2); // skip num_tags
 
-            if tag_present == 1 {
-                // Read tag length (4 bytes, u32 little-endian)
-                let tag_len = self.tags_ptr.add(1).cast::<u32>().read_unaligned() as usize;
+            for _ in 0..num_tags {
+                let key_len = cursor.cast::<u16>().read_unaligned() as usize;
+                cursor = cursor.add(2);
+                let key_bytes = std::slice::from_raw_parts(cursor, key_len);
+                let key = String::from_utf8_lossy(key_bytes).into_owned();
+                cursor = cursor.add(key_len);
 
-                // Read tag string bytes
-                let tag_bytes = std::slice::from_raw_parts(
-                    self.tags_ptr.add(5),
-                    tag_len,
-                );
+                let value_len = cursor.cast::<u16>().read_unaligned() as usize;
+                cursor = cursor.add(2);
+                let value_bytes = std::slice::from_raw_parts(cursor, value_len);
+                let value = String::from_utf8_lossy(value_bytes).into_owned();
+                cursor = cursor.add(value_len);
 
-                // Convert to String (may fail if not valid UTF-8)
-                String::from_utf8(tag_bytes.to_vec()).ok()
-            } else {
-                None
+                map.insert(key, value);
             }
+
+            map
         }
+    }
+
+    /// Look up a single tag value by key, without allocating a HashMap.
+    /// Returns None if the tag is not present.
+    pub fn tag_value(&self, target_key: &str) -> Option<String> {
+        unsafe {
+            let num_tags = self.tags_ptr.cast::<u16>().read_unaligned() as usize;
+            let mut cursor = self.tags_ptr.add(2);
+
+            for _ in 0..num_tags {
+                let key_len = cursor.cast::<u16>().read_unaligned() as usize;
+                cursor = cursor.add(2);
+                let key_bytes = std::slice::from_raw_parts(cursor, key_len);
+                cursor = cursor.add(key_len);
+
+                let value_len = cursor.cast::<u16>().read_unaligned() as usize;
+                cursor = cursor.add(2);
+                let value_bytes = std::slice::from_raw_parts(cursor, value_len);
+                cursor = cursor.add(value_len);
+
+                if key_bytes == target_key.as_bytes() {
+                    return Some(String::from_utf8_lossy(value_bytes).into_owned());
+                }
+            }
+
+            None
+        }
+    }
+
+    /// Check if a tag key exists (without allocating)
+    pub fn has_tag(&self, target_key: &str) -> bool {
+        unsafe {
+            let num_tags = self.tags_ptr.cast::<u16>().read_unaligned() as usize;
+            let mut cursor = self.tags_ptr.add(2);
+
+            for _ in 0..num_tags {
+                let key_len = cursor.cast::<u16>().read_unaligned() as usize;
+                cursor = cursor.add(2);
+                let key_bytes = std::slice::from_raw_parts(cursor, key_len);
+                cursor = cursor.add(key_len);
+
+                let value_len = cursor.cast::<u16>().read_unaligned() as usize;
+                cursor = cursor.add(2);
+                cursor = cursor.add(value_len);
+
+                if key_bytes == target_key.as_bytes() {
+                    return true;
+                }
+            }
+
+            false
+        }
+    }
+
+    /// Get number of tags (without reading them)
+    pub fn num_tags(&self) -> usize {
+        unsafe { self.tags_ptr.cast::<u16>().read_unaligned() as usize }
     }
 }
 
@@ -155,42 +220,47 @@ mod tests {
     use tempfile::NamedTempFile;
 
     #[test]
-    #[ignore] // Phase 0: Deferred - has alignment issues, will be fixed in Phase 1
-    fn test_mmap_read() -> io::Result<()> {
-        // Create a temporary file with map objects
+    fn test_mmap_read_v2() -> io::Result<()> {
         let mut temp_file = NamedTempFile::new()?;
 
-        let obj1 = MapObject {
-            bounding_box: BoundingBox {
+        let obj1 = MapObject::new(
+            BoundingBox {
                 min: Point::new(10.0, 20.0),
                 max: Point::new(30.0, 40.0),
             },
-            points: vec![
+            vec![
                 Point::new(15.0, 25.0),
                 Point::new(20.0, 30.0),
             ],
-            highway_tag: None, // Phase 0: added highway_tag field
-        };
+            false,
+            vec![("highway".to_string(), "primary".to_string())],
+        );
 
-        let obj2 = MapObject {
-            bounding_box: BoundingBox {
+        let obj2 = MapObject::new(
+            BoundingBox {
                 min: Point::new(50.0, 60.0),
                 max: Point::new(70.0, 80.0),
             },
-            points: vec![
+            vec![
                 Point::new(55.0, 65.0),
                 Point::new(60.0, 70.0),
                 Point::new(65.0, 75.0),
+                Point::new(55.0, 65.0), // closed
             ],
-            highway_tag: None, // Phase 0: added highway_tag field
-        };
+            true,
+            vec![
+                ("building".to_string(), "yes".to_string()),
+                ("name".to_string(), "Test".to_string()),
+            ],
+        );
 
         // Write objects
         let offset1 = write_map_object(temp_file.as_file_mut(), &obj1)?;
         let offset2 = write_map_object(temp_file.as_file_mut(), &obj2)?;
 
         // Ensure data is flushed
-        temp_file.as_file_mut().sync_all()?;
+        use std::io::Write;
+        temp_file.as_file_mut().flush()?;
 
         // Memory map the file
         let mmap_data = MappedData::new(temp_file.path())?;
@@ -204,14 +274,19 @@ mod tests {
         assert_eq!(view1.num_points(), 2);
         assert_eq!(view1.points[0].lon, 15.0);
         assert_eq!(view1.points[0].lat, 25.0);
+        assert!(!view1.is_area());
+        let tags1 = view1.tags();
+        assert_eq!(tags1.get("highway"), Some(&"primary".to_string()));
 
         // Read second object
         let view2 = mmap_data.read_map_object(offset2);
         assert_eq!(view2.bbox.min.lon, 50.0);
         assert_eq!(view2.bbox.min.lat, 60.0);
-        assert_eq!(view2.num_points(), 3);
-        assert_eq!(view2.points[1].lon, 60.0);
-        assert_eq!(view2.points[1].lat, 70.0);
+        assert_eq!(view2.num_points(), 4);
+        assert!(view2.is_area());
+        let tags2 = view2.tags();
+        assert_eq!(tags2.get("building"), Some(&"yes".to_string()));
+        assert_eq!(tags2.get("name"), Some(&"Test".to_string()));
 
         Ok(())
     }

@@ -48,12 +48,38 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     log::info!("Creating {:?} shader renderer...", shader_type);
     let mut renderer = VulkanRenderer::new(tile_index.max_points, shader_type)?;
 
-    // Phase 0: Set test MapCSS stylesheet for styled shader
+    // Set MapCSS stylesheet for styled shader
     if shader_type == ShaderType::Styled {
-        log::info!("Setting MapCSS stylesheet: way[highway=primary] {{ color: #ff0000; }}");
-        renderer.set_stylesheet("way[highway=primary] { color: #ff0000; }")
+        let stylesheet = r#"
+            area[landuse=residential]  { fill-color: #e0dfdf; z-index: -5; }
+            area[landuse=forest]       { fill-color: #add19e; z-index: -4; }
+            area[landuse=grass]        { fill-color: #cdebb0; z-index: -4; }
+            area[landuse=commercial]   { fill-color: #f2dad9; z-index: -5; }
+            area[landuse=industrial]   { fill-color: #ebdbe8; z-index: -5; }
+            area[natural=water]        { fill-color: #aad3df; z-index: -2; }
+            area[waterway=riverbank]   { fill-color: #aad3df; z-index: -2; }
+            area[natural=wood]         { fill-color: #add19e; z-index: -3; }
+            area[leisure=park]         { fill-color: #c8facc; z-index: -3; }
+            area[leisure=garden]       { fill-color: #cdebb0; z-index: -3; }
+            area|z13-[building]        { fill-color: #d9d0c9; z-index: 1; }
+            area[amenity=parking]      { fill-color: #eeeeee; z-index: -1; }
+            way { color: #999999; width: 1; z-index: 0; }
+            way|z6-[highway=motorway]       { color: #cf3030; width: 5; z-index: 9; }
+            way|z8-[highway=trunk]          { color: #d85f2a; width: 4; z-index: 8; }
+            way|z8-[highway=primary]        { color: #d4a012; width: 3; z-index: 7; }
+            way|z10-[highway=secondary]     { color: #a4a41a; width: 2.5; z-index: 6; }
+            way|z11-[highway=tertiary]      { color: #b0b0b0; width: 2; z-index: 5; }
+            way|z12-[highway=residential]   { color: #b0b0b0; width: 1.5; z-index: 4; }
+            way|z12-[highway=unclassified]  { color: #b0b0b0; width: 1.5; z-index: 4; }
+            way|z14-[highway=service]       { color: #c0c0c0; width: 1; z-index: 3; }
+            way|z13-[highway=living_street] { color: #c0c0c0; width: 1; z-index: 3; }
+            way|z13-[highway=motorway_link] { color: #cf3030; width: 2; z-index: 8; }
+            way|z13-[highway=trunk_link]    { color: #d85f2a; width: 2; z-index: 7; }
+            way|z13-[highway=primary_link]  { color: #d4a012; width: 2; z-index: 6; }
+        "#;
+        log::info!("Setting MapCSS stylesheet with area fills and road hierarchy");
+        renderer.set_stylesheet(stylesheet)
             .expect("Failed to set stylesheet");
-        renderer.set_data_file_path(temp_file.path().to_string_lossy().to_string());
     }
 
     // Render tile
