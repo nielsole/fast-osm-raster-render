@@ -23,36 +23,69 @@ const AREA_TAGS: &[&str] = &[
     "building", "natural", "waterway", "landuse", "leisure", "amenity",
 ];
 
-/// Check if a way should be displayed at zoom levels < 11
-/// Only major roads and large features are shown at lower zoom levels
-fn is_important(tags: &[(String, String)]) -> bool {
+/// Compute the minimum zoom at which this way should be included in the tile index.
+/// Lower values mean "show earlier" (more important at low zoom).
+///
+/// Defaults to 11, which effectively drops local/detail-heavy features for z<11.
+fn low_zoom_min(tags: &[(String, String)]) -> u8 {
+    let mut min_z = 11u8;
+
     for (key, value) in tags {
         if key == "highway" {
-            match value.as_str() {
-                "motorway" | "trunk" | "primary" | "secondary" | "tertiary"
-                | "motorway_link" | "trunk_link" | "primary_link"
-                | "secondary_link" | "tertiary_link" => return true,
-                _ => {}
+            let z = match value.as_str() {
+                "motorway" | "motorway_link" => Some(5),
+                "trunk" | "trunk_link" => Some(6),
+                "primary" | "primary_link" => Some(7),
+                "secondary" | "secondary_link" => Some(8),
+                "tertiary" | "tertiary_link" => Some(9),
+                _ => None,
+            };
+            if let Some(z) = z {
+                min_z = min_z.min(z);
             }
-        }
-        // Large water bodies and forests are important at low zoom
-        if key == "natural" {
-            match value.as_str() {
-                "water" | "wood" => return true,
-                _ => {}
+        } else if key == "natural" {
+            let z = match value.as_str() {
+                "water" => Some(6),
+                "wood" => Some(8),
+                _ => None,
+            };
+            if let Some(z) = z {
+                min_z = min_z.min(z);
             }
-        }
-        if key == "waterway" && value == "riverbank" {
-            return true;
-        }
-        if key == "landuse" {
-            match value.as_str() {
-                "forest" | "residential" => return true,
-                _ => {}
+        } else if key == "waterway" {
+            let z = match value.as_str() {
+                "riverbank" => Some(6),
+                "river" | "canal" => Some(7),
+                "stream" => Some(9),
+                _ => None,
+            };
+            if let Some(z) = z {
+                min_z = min_z.min(z);
+            }
+        } else if key == "railway" {
+            let z = match value.as_str() {
+                "rail" => Some(8),
+                "light_rail" | "subway" | "tram" => Some(9),
+                _ => None,
+            };
+            if let Some(z) = z {
+                min_z = min_z.min(z);
+            }
+        } else if key == "boundary" && value == "administrative" {
+            min_z = min_z.min(7);
+        } else if key == "landuse" {
+            let z = match value.as_str() {
+                "forest" => Some(8),
+                "residential" | "commercial" | "industrial" => Some(10),
+                _ => None,
+            };
+            if let Some(z) = z {
+                min_z = min_z.min(z);
             }
         }
     }
-    false
+
+    min_z
 }
 
 /// Detect if a closed way with these tags should be flagged as an area
@@ -69,7 +102,7 @@ fn has_area_tag(tags: &[(String, String)]) -> bool {
 struct WayMeta {
     offset: u64,
     bbox: BoundingBox,
-    is_important: bool,
+    low_zoom_min: u8,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -79,10 +112,12 @@ struct NodeCoord {
     lat_dm7: i32,
 }
 
-const META_CACHE_MAGIC: &[u8; 8] = b"OSMMETA1";
+const META_CACHE_MAGIC: &[u8; 8] = b"OSMMETA2";
 const NODE_RECORD_SIZE: usize = 16; // i64 node_id + i32 lon_dm7 + i32 lat_dm7
-const SIMPLIFIED_CACHE_VERSION: u32 = 1;
+const INDEX_CACHE_VERSION: u32 = 2;
+const SIMPLIFIED_CACHE_VERSION: u32 = 3;
 const SIMPLIFIED_MIN_POINTS: usize = 24;
+const SIMPLIFIED_MIN_AREA_POINTS: usize = 12;
 const DEFAULT_CACHE_DIR: &str = ".osm-cache";
 const LEGACY_CACHE_DIR: &str = "/tmp/rust-osm-renderer-cache";
 
@@ -149,15 +184,14 @@ pub fn load_osm_data<P: AsRef<Path>>(
                     }
                 };
 
-                // Check if this is an important way for zoom < 11 filtering
-                let important = is_important(&tags);
+                let min_zoom = low_zoom_min(&tags);
 
                 // Get all tiles that overlap with this way's bounding box
                 let tiles = get_tiles_for_bounding_box(&bounding_box, 0, max_z);
 
                 for tile in tiles {
-                    // Skip non-important ways at zoom < 11
-                    if !important && tile.z < 11 {
+                    // Skip features that are below their low-zoom visibility tier.
+                    if tile.z < min_zoom as u32 {
                         continue;
                     }
 
@@ -282,8 +316,14 @@ fn cache_paths(osm_path: &Path, max_z: u32) -> io::Result<(PathBuf, PathBuf, Pat
 
     let data_cache_path = cache_root.join(format!("{}.cache.data", prefix));
     let meta_cache_path = cache_root.join(format!("{}.cache.meta", prefix));
-    let index_cache_path = cache_root.join(format!("{}.cache.z{}.index", prefix, max_z));
-    let toc_cache_path = cache_root.join(format!("{}.cache.z{}.toc", prefix, max_z));
+    let index_cache_path = cache_root.join(format!(
+        "{}.cache.v{}.z{}.index",
+        prefix, INDEX_CACHE_VERSION, max_z
+    ));
+    let toc_cache_path = cache_root.join(format!(
+        "{}.cache.v{}.z{}.toc",
+        prefix, INDEX_CACHE_VERSION, max_z
+    ));
     Ok((data_cache_path, meta_cache_path, index_cache_path, toc_cache_path))
 }
 
@@ -440,6 +480,43 @@ fn simplify_line_points(points: &[Point], zoom: u32) -> Vec<Point> {
     }
 }
 
+#[inline(always)]
+fn points_equal(a: Point, b: Point) -> bool {
+    (a.lon - b.lon).abs() < 1e-10 && (a.lat - b.lat).abs() < 1e-10
+}
+
+fn simplify_area_points(points: &[Point], zoom: u32) -> Vec<Point> {
+    if points.len() < 4 {
+        return points.to_vec();
+    }
+
+    let is_closed = points_equal(points[0], points[points.len() - 1]);
+    if !is_closed {
+        return simplify_line_points(points, zoom);
+    }
+
+    let ring = &points[..points.len() - 1];
+    if ring.len() < 3 {
+        return points.to_vec();
+    }
+
+    // Reuse the line simplifier on the open ring, then re-close the polygon.
+    let mut simplified = simplify_line_points(ring, zoom);
+    if simplified.len() < 3 {
+        return points.to_vec();
+    }
+
+    if !points_equal(simplified[0], *simplified.last().unwrap()) {
+        simplified.push(simplified[0]);
+    }
+
+    if simplified.len() < 4 {
+        return points.to_vec();
+    }
+
+    simplified
+}
+
 fn write_way_meta_cache<W: Write>(
     writer: &mut W,
     way_metas: &[WayMeta],
@@ -459,7 +536,7 @@ fn write_way_meta_cache<W: Write>(
         writer.write_f64::<LittleEndian>(meta.bbox.min.lat)?;
         writer.write_f64::<LittleEndian>(meta.bbox.max.lon)?;
         writer.write_f64::<LittleEndian>(meta.bbox.max.lat)?;
-        writer.write_u8(if meta.is_important { 1 } else { 0 })?;
+        writer.write_u8(meta.low_zoom_min)?;
     }
 
     Ok(())
@@ -494,14 +571,14 @@ fn read_way_meta_cache<R: Read>(
         let min_lat = reader.read_f64::<LittleEndian>()?;
         let max_lon = reader.read_f64::<LittleEndian>()?;
         let max_lat = reader.read_f64::<LittleEndian>()?;
-        let is_important = reader.read_u8()? != 0;
+        let low_zoom_min = reader.read_u8()?;
         metas.push(WayMeta {
             offset,
             bbox: BoundingBox {
                 min: Point::new(min_lon, min_lat),
                 max: Point::new(max_lon, max_lat),
             },
-            is_important,
+            low_zoom_min,
         });
     }
 
@@ -521,7 +598,7 @@ fn build_tile_index_from_way_metas(
             for meta in chunk {
                 let tiles = get_tiles_for_bounding_box(&meta.bbox, 0, max_z);
                 for tile in tiles {
-                    if !meta.is_important && tile.z < 11 {
+                    if tile.z < meta.low_zoom_min as u32 {
                         continue;
                     }
                     local.entry(tile.index()).or_default().push(meta.offset);
@@ -769,7 +846,7 @@ fn build_cache_from_locations_on_ways(
                     && (first.lon - last.lon).abs() < 1e-10
                     && (first.lat - last.lat).abs() < 1e-10;
                 let is_area = is_closed && has_area_tag(&tags);
-                let important = is_important(&tags);
+                let min_zoom = low_zoom_min(&tags);
 
                 let points_len = points.len();
                 let map_object = MapObject::new(bbox, points, is_area, tags);
@@ -787,7 +864,7 @@ fn build_cache_from_locations_on_ways(
                 way_metas.push(WayMeta {
                     offset,
                     bbox,
-                    is_important: important,
+                    low_zoom_min: min_zoom,
                 });
 
                 way_count += 1;
@@ -1068,7 +1145,7 @@ fn build_cache_from_raw_pbf(
                     && (first.lon - last.lon).abs() < 1e-10
                     && (first.lat - last.lat).abs() < 1e-10;
                 let is_area = is_closed && has_area_tag(&tags);
-                let important = is_important(&tags);
+                let min_zoom = low_zoom_min(&tags);
 
                 let points_len = points.len();
                 let map_object = MapObject::new(bbox, points, is_area, tags);
@@ -1086,7 +1163,7 @@ fn build_cache_from_raw_pbf(
                 way_metas.push(WayMeta {
                     offset,
                     bbox,
-                    is_important: important,
+                    low_zoom_min: min_zoom,
                 });
 
                 way_count += 1;
@@ -1124,8 +1201,8 @@ fn build_cache_from_raw_pbf(
 /// Cache files are stored under `RUST_OSM_CACHE_DIR` (default: `.osm-cache`):
 /// - data: `<name>-<hash>.cache.data` (independent of `max_z`)
 /// - meta: `<name>-<hash>.cache.meta` (way metadata for fast index rebuild)
-/// - index: `<name>-<hash>.cache.z<max_z>.index` (depends on zoom coverage)
-/// - toc: `<name>-<hash>.cache.z<max_z>.toc` (tile->offset table for fast lazy index startup)
+/// - index: `<name>-<hash>.cache.v<policy>.z<max_z>.index` (depends on zoom coverage/policy)
+/// - toc: `<name>-<hash>.cache.v<policy>.z<max_z>.toc` (tile->offset table for fast lazy index startup)
 pub fn load_osm_data_cached<P: AsRef<Path>>(
     osm_path: P,
     max_z: u32,
@@ -1327,16 +1404,21 @@ pub fn load_low_zoom_simplified_cached<P: AsRef<Path>>(
         .unwrap_or(20_000);
 
     for (batch_idx, chunk) in way_metas.chunks(batch_size).enumerate() {
-        let simplified_batch: Vec<Option<(MapObject, bool)>> = chunk
+        let simplified_batch: Vec<Option<(MapObject, u8)>> = chunk
             .par_iter()
             .map(|meta| {
+                if meta.low_zoom_min > low_zoom_max as u8 {
+                    return None;
+                }
                 let view = source_mmap.read_map_object(meta.offset);
                 let points = view.points();
                 if points.len() < 2 {
                     return None;
                 }
 
-                let mut out_points = if !view.is_area() && points.len() >= SIMPLIFIED_MIN_POINTS {
+                let mut out_points = if view.is_area() && points.len() >= SIMPLIFIED_MIN_AREA_POINTS {
+                    simplify_area_points(points, low_zoom_max)
+                } else if !view.is_area() && points.len() >= SIMPLIFIED_MIN_POINTS {
                     simplify_line_points(points, low_zoom_max)
                 } else {
                     points.to_vec()
@@ -1349,18 +1431,18 @@ pub fn load_low_zoom_simplified_cached<P: AsRef<Path>>(
                 let bbox = BoundingBox::from_points(&out_points)?;
                 let tags: Vec<(String, String)> = view.tags().into_iter().collect();
                 let obj = MapObject::new(bbox, out_points, view.is_area(), tags);
-                Some((obj, meta.is_important))
+                Some((obj, meta.low_zoom_min))
             })
             .collect();
 
         for entry in simplified_batch.into_iter().flatten() {
-            let (obj, is_important) = entry;
+            let (obj, low_zoom_min) = entry;
             max_points = max_points.max(obj.points.len());
             let offset = write_map_object(&mut writer, &obj)?;
             simplified_metas.push(WayMeta {
                 offset,
                 bbox: obj.bounding_box,
-                is_important,
+                low_zoom_min,
             });
         }
 
@@ -1391,24 +1473,30 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_is_important() {
+    fn test_low_zoom_min() {
         let motorway = vec![("highway".to_string(), "motorway".to_string())];
-        assert!(is_important(&motorway));
+        assert_eq!(low_zoom_min(&motorway), 5);
 
         let residential = vec![("highway".to_string(), "residential".to_string())];
-        assert!(!is_important(&residential));
+        assert_eq!(low_zoom_min(&residential), 11);
 
         let primary = vec![("highway".to_string(), "primary".to_string())];
-        assert!(is_important(&primary));
+        assert_eq!(low_zoom_min(&primary), 7);
 
         let footway = vec![("highway".to_string(), "footway".to_string())];
-        assert!(!is_important(&footway));
+        assert_eq!(low_zoom_min(&footway), 11);
 
         let water = vec![("natural".to_string(), "water".to_string())];
-        assert!(is_important(&water));
+        assert_eq!(low_zoom_min(&water), 6);
 
         let forest = vec![("landuse".to_string(), "forest".to_string())];
-        assert!(is_important(&forest));
+        assert_eq!(low_zoom_min(&forest), 8);
+
+        let rail = vec![("railway".to_string(), "rail".to_string())];
+        assert_eq!(low_zoom_min(&rail), 8);
+
+        let admin = vec![("boundary".to_string(), "administrative".to_string())];
+        assert_eq!(low_zoom_min(&admin), 7);
     }
 
     #[test]
@@ -1424,5 +1512,38 @@ mod tests {
 
         let park = vec![("leisure".to_string(), "park".to_string())];
         assert!(has_area_tag(&park));
+    }
+
+    #[test]
+    fn test_simplify_area_points_keeps_closed_ring() {
+        let polygon = vec![
+            Point::new(0.0, 0.0),
+            Point::new(1.0, 0.0),
+            Point::new(2.0, 0.01),
+            Point::new(3.0, 0.0),
+            Point::new(3.0, 1.0),
+            Point::new(2.0, 1.0),
+            Point::new(1.0, 1.0),
+            Point::new(0.0, 1.0),
+            Point::new(0.0, 0.0),
+        ];
+
+        let simplified = simplify_area_points(&polygon, 7);
+        assert!(simplified.len() >= 4);
+        assert!(points_equal(simplified[0], *simplified.last().unwrap()));
+    }
+
+    #[test]
+    fn test_simplify_area_points_fallback_for_tiny_polygon() {
+        let tiny = vec![
+            Point::new(0.0, 0.0),
+            Point::new(1.0, 0.0),
+            Point::new(0.0, 1.0),
+            Point::new(0.0, 0.0),
+        ];
+
+        let simplified = simplify_area_points(&tiny, 7);
+        assert!(simplified.len() >= 4);
+        assert!(points_equal(simplified[0], *simplified.last().unwrap()));
     }
 }

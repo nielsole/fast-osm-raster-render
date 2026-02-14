@@ -16,12 +16,22 @@ impl Tile {
     /// This MUST match the Go version exactly
     pub fn index(&self) -> u64 {
         // Closed-form geometric series: sum of 4^z for z in 0..self.z = (4^self.z - 1) / 3
-        let total = if self.z == 0 { 0 } else { (4u64.pow(self.z) - 1) / 3 };
+        // Compute safely to avoid debug overflows on malformed/very large zooms.
+        let total = if self.z == 0 {
+            0
+        } else if self.z >= 32 {
+            u64::MAX
+        } else {
+            ((1u64 << (2 * self.z)) - 1) / 3
+        };
 
         // Calculate the position of the tile within its zoom level
-        let level_pos = self.y * 2u32.pow(self.z) + self.x;
+        let level_width = 1u64.checked_shl(self.z).unwrap_or(u64::MAX);
+        let level_pos = (self.y as u64)
+            .saturating_mul(level_width)
+            .saturating_add(self.x as u64);
 
-        total + level_pos as u64
+        total.saturating_add(level_pos)
     }
 
     /// Get the parent tile (one zoom level up)
@@ -188,6 +198,15 @@ mod tests {
 
         // Zoom level 2 starts at index 5 (after 1 + 4 tiles)
         assert_eq!(Tile::new(0, 0, 2).index(), 5);
+
+        // High zoom should not overflow in debug builds.
+        let z = 17;
+        let x = 12345;
+        let y = 67890;
+        let idx = Tile::new(x, y, z).index();
+        let total = ((1u64 << (2 * z)) - 1) / 3;
+        let expected = total + (y as u64) * (1u64 << z) + x as u64;
+        assert_eq!(idx, expected);
     }
 
     #[test]
