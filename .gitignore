@@ -1,3 +1,7 @@
 /target
 *__pycache__
 .osm-cache/
+eval/results.tsv
+eval/.cache/
+eval/prepare.log
+eval/run.log
