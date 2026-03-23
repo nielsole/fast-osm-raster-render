@@ -1,0 +1,6 @@
+# Cache directory (downloaded data, reference tiles, rendered output)
+.cache/
+
+# Evaluation results (untracked, like autoresearch's results.tsv)
+results.tsv
+run.log
